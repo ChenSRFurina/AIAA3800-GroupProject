@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>VPet.Plugin.Speaking</RootNamespace>
+    <AssemblyName>VPet.Plugin.Speaking</AssemblyName>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VPet-Simulator.Windows.Interface\VPet-Simulator.Windows.Interface.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="SmokeTest\**" />
+    <None Remove="SmokeTest\**" />
+    <EmbeddedResource Remove="SmokeTest\**" />
+  </ItemGroup>
+
+  <!-- 编译后自动部署到游戏 mod 目录（及已存在的 bin 输出目录） -->
+  <Target Name="DeployToMod" AfterTargets="Build">
+    <PropertyGroup>
+      <ModPluginDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\mod\1200_VPet-Speaking\plugin</ModPluginDir>
+      <BinModPluginDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod\1200_VPet-Speaking\plugin</BinModPluginDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(ModPluginDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\xunfei.config" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(MSBuildProjectDirectory)\xunfei.config')" />
+    <!-- 若已用 mklink 链接 mod，则上面已足够；否则额外拷到 bin -->
+    <MakeDir Directories="$(BinModPluginDir)" Condition="Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows') And !Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod')" />
+    <Copy SourceFiles="$(TargetPath);$(MSBuildProjectDirectory)\xunfei.config" DestinationFolder="$(BinModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(BinModPluginDir)')" />
+  </Target>
+</Project>
