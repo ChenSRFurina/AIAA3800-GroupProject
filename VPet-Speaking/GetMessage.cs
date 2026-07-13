@@ -5,8 +5,8 @@ namespace VPet.Plugin.Speaking
     /// </summary>
     public static class GetMessage
     {
-        /// <summary>测试样例文本（与 get_message.py 一致）。</summary>
-        public const string TestSample = "This is used for testing. You just need to change this line in furture.";
+        /// <summary>测试样例文本（短句，便于本地 F5 低延迟合成）。</summary>
+        public const string TestSample = "你好，我是太乙真人。";
 
         /// <summary>
         /// 获取要合成的文本。当前直接返回传入内容；后续可在此接入 LLM / 对话逻辑。

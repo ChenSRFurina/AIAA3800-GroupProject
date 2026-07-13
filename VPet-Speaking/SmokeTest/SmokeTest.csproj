@@ -10,6 +10,7 @@
     <ProjectReference Include="..\VPet.Plugin.Speaking.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\xunfei.config" CopyToOutputDirectory="PreserveNewest" Link="xunfei.config" />
+    <None Include="..\f5tts.config" CopyToOutputDirectory="PreserveNewest" Link="f5tts.config" />
+    <None Include="..\xunfei.config" CopyToOutputDirectory="PreserveNewest" Link="xunfei.config" Condition="Exists('..\xunfei.config')" />
   </ItemGroup>
 </Project>

@@ -1,1 +1,22 @@
 /xunfei.config
+
+# --- Local_model: 模型权重与 HuggingFace 下载缓存（本地自行下载）---
+Local_model/model/F5TTS_Base/
+Local_model/model/F5TTS_Base_bigvgan/
+Local_model/model/F5TTS_v1_Base/
+Local_model/model/F5TTS_v1_Base_no_zero_init/
+Local_model/model/.cache/
+Local_model/model/tests/
+Local_model/model/**/*.safetensors
+Local_model/model/**/*.pt
+Local_model/model/**/*.pth
+Local_model/model/**/pytorch_model.bin
+
+# F5-TTS 上游仓库 clone（本地 git clone；仅提交 Fast_generating 自研脚本）
+Local_model/F5-TTS/*
+!Local_model/F5-TTS/Fast_generating/
+Local_model/F5-TTS/Fast_generating/outputs/
+
+# Python 运行时产物
+Local_model/**/__pycache__/
+Local_model/**/*.egg-info/

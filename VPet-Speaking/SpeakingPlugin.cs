@@ -9,11 +9,12 @@ using ToolBar = VPet_Simulator.Core.ToolBar;
 namespace VPet.Plugin.Speaking
 {
     /// <summary>
-    /// 讯飞语音合成插件：在 DIY 菜单增加「说话」按钮，合成并播放测试样例语音。
+    /// 本地 F5-TTS 语音合成插件：DIY「说话」按钮，优先走 Fast_generating 常驻服务以降低延迟。
     /// </summary>
     public class SpeakingPlugin : MainPlugin
     {
-        private XunfeiTtsClient? _tts;
+        private F5TtsClient? _f5;
+        private XunfeiTtsClient? _xunfei;
         private bool _busy;
 
         public SpeakingPlugin(IMainWindow mainwin) : base(mainwin) { }
@@ -23,13 +24,15 @@ namespace VPet.Plugin.Speaking
 
         public override void LoadPlugin()
         {
+            _f5 = F5TtsClient.FromConfigNearAssembly();
+
             try
             {
-                _tts = XunfeiTtsClient.FromConfigNearAssembly();
+                _xunfei = XunfeiTtsClient.FromConfigNearAssembly();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[VPet-Speaking] 加载讯飞配置失败: {ex.Message}");
+                Console.WriteLine($"[VPet-Speaking] 讯飞配置未加载（本地 F5 优先，可忽略）: {ex.Message}");
             }
 
             var voiceDir = Path.Combine(GraphCore.CachePath, "voice");
@@ -43,7 +46,7 @@ namespace VPet.Plugin.Speaking
         }
 
         /// <summary>
-        /// 按下「说话」：取 get_message 测试样例 → 讯飞合成 → 气泡+语音。
+        /// 按下「说话」：取测试样例 → 本地 F5 合成（失败再试讯飞）→ 气泡+语音。
         /// </summary>
         private void SpeakTestSample()
         {
@@ -57,21 +60,7 @@ namespace VPet.Plugin.Speaking
                 return;
             }
 
-            if (_tts == null)
-            {
-                try
-                {
-                    _tts = XunfeiTtsClient.FromConfigNearAssembly();
-                }
-                catch (Exception ex)
-                {
-                    MessageBoxX.Show(
-                        ("讯飞配置加载失败: ".Translate() + ex.Message),
-                        "VPet-Speaking");
-                    return;
-                }
-            }
-
+            _f5 ??= F5TtsClient.FromConfigNearAssembly();
             _busy = true;
             MW.Main.ToolBar.Visibility = Visibility.Collapsed;
 
@@ -79,16 +68,16 @@ namespace VPet.Plugin.Speaking
             {
                 try
                 {
-                    var audio = await _tts.SynthesizeAsync(text).ConfigureAwait(false);
+                    var (audio, ext, engine) = await SynthesizeWithFallbackAsync(text).ConfigureAwait(false);
                     var path = Path.Combine(
                         GraphCore.CachePath,
                         "voice",
-                        $"xunfei_{Math.Abs(text.GetHashCode()):X}.mp3");
+                        $"{engine}_{Math.Abs(text.GetHashCode()):X}.{ext}");
                     await File.WriteAllBytesAsync(path, audio).ConfigureAwait(false);
+                    Console.WriteLine($"[VPet-Speaking] {engine} 合成完成 -> {path} ({audio.Length} bytes)");
 
                     MW.Main.Dispatcher.Invoke(() =>
                     {
-                        // SayRnd 会自动选用内置 GraphType.Say 动画
                         MW.Main.SayRnd(text, force: true);
                         MW.Main.PlayVoice(new Uri(path));
                     });
@@ -98,10 +87,10 @@ namespace VPet.Plugin.Speaking
                     MW.Main.Dispatcher.Invoke(() =>
                     {
                         MessageBoxX.Show(
-                            ("语音合成失败: ".Translate() + ex.Message),
+                            ("语音合成失败: ".Translate() + ex.Message +
+                             "\n\n请先启动本地服务:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
                             "VPet-Speaking",
                             MessageBoxIcon.Error);
-                        // 即使合成失败，仍显示文字气泡 + 说话动画，便于调试
                         MW.Main.SayRnd(text, force: true);
                     });
                 }
@@ -110,6 +99,37 @@ namespace VPet.Plugin.Speaking
                     _busy = false;
                 }
             });
+        }
+
+        /// <summary>优先本地 F5；连不上再回退讯飞（若已配置）。</summary>
+        private async Task<(byte[] Audio, string Ext, string Engine)> SynthesizeWithFallbackAsync(string text)
+        {
+            try
+            {
+                var wav = await _f5!.SynthesizeAsync(text).ConfigureAwait(false);
+                return (wav, "wav", "f5");
+            }
+            catch (Exception f5Ex)
+            {
+                Console.WriteLine($"[VPet-Speaking] F5 失败，尝试讯飞回退: {f5Ex.Message}");
+
+                if (_xunfei == null)
+                {
+                    try
+                    {
+                        _xunfei = XunfeiTtsClient.FromConfigNearAssembly();
+                    }
+                    catch
+                    {
+                        throw new InvalidOperationException(
+                            f5Ex.Message + "\n（讯飞回退也不可用：未找到 xunfei.config）",
+                            f5Ex);
+                    }
+                }
+
+                var mp3 = await _xunfei.SynthesizeAsync(text).ConfigureAwait(false);
+                return (mp3, "mp3", "xunfei");
+            }
         }
     }
 }

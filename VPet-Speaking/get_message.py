@@ -10,5 +10,5 @@ def get_message(message):
     return ""
 
 
-# 测试用例：
-message = get_message("This is used for testing. You just need to change this line in furture.")
+# 测试用例（短句，便于本地 F5 低延迟合成）：
+message = get_message("你好，我是太乙真人。")
