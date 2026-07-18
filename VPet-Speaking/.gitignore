@@ -16,6 +16,7 @@ Local_model/model/**/pytorch_model.bin
 Local_model/F5-TTS/*
 !Local_model/F5-TTS/Fast_generating/
 Local_model/F5-TTS/Fast_generating/outputs/
+Local_model/F5-TTS/Fast_generating/temp/
 
 # Python 运行时产物
 Local_model/**/__pycache__/

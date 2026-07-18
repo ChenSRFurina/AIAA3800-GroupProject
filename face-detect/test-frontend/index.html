@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Emotion Test Frontend</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5efe6;
+        --panel: rgba(255, 251, 245, 0.88);
+        --ink: #1f2937;
+        --accent: #c46a3a;
+        --accent-strong: #8d3f1f;
+        --line: rgba(31, 41, 55, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(196, 106, 58, 0.24), transparent 24%),
+          radial-gradient(circle at right, rgba(72, 148, 126, 0.22), transparent 22%),
+          linear-gradient(160deg, #f9f4ea 0%, #f3e7d7 48%, #efe3d5 100%);
+      }
+
+      main {
+        width: min(1120px, calc(100vw - 32px));
+        margin: 24px auto;
+        display: grid;
+        gap: 20px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: 0 18px 48px rgba(64, 36, 24, 0.12);
+        backdrop-filter: blur(16px);
+      }
+
+      .hero {
+        padding: 24px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: clamp(28px, 5vw, 44px);
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+
+      p {
+        margin: 0;
+        max-width: 680px;
+        line-height: 1.6;
+      }
+
+      .layout {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: minmax(0, 1.8fr) minmax(280px, 1fr);
+      }
+
+      .stage {
+        padding: 18px;
+      }
+
+      .video-shell {
+        position: relative;
+        border-radius: 20px;
+        overflow: hidden;
+        background: #120e0a;
+        aspect-ratio: 4 / 3;
+      }
+
+      video,
+      canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      video {
+        object-fit: cover;
+        transform: scaleX(-1);
+      }
+
+      #overlay {
+        pointer-events: none;
+      }
+
+      .controls,
+      .sidebar {
+        padding: 18px;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        font: inherit;
+        color: white;
+        background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        padding: 8px 12px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid var(--line);
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: #9ca3af;
+      }
+
+      .dot.live {
+        background: #0ea5a4;
+        box-shadow: 0 0 0 8px rgba(14, 165, 164, 0.16);
+      }
+
+      .sidebar {
+        display: grid;
+        gap: 16px;
+      }
+
+      .meta {
+        display: grid;
+        gap: 10px;
+        font-size: 14px;
+      }
+
+      .meta strong {
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(31, 41, 55, 0.66);
+      }
+
+      pre {
+        margin: 0;
+        padding: 14px;
+        border-radius: 18px;
+        background: rgba(17, 24, 39, 0.94);
+        color: #f9fafb;
+        overflow: auto;
+        min-height: 220px;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .emotion-panel,
+      .fatigue-panel {
+        display: grid;
+        gap: 14px;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(31, 41, 55, 0.66);
+      }
+
+      .emotion-face,
+      .fatigue-card {
+        display: grid;
+        gap: 10px;
+        padding: 14px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid var(--line);
+      }
+
+      .emotion-face-header,
+      .fatigue-summary,
+      .emotion-row-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .emotion-bars,
+      .metric-grid {
+        display: grid;
+        gap: 10px;
+      }
+
+      .emotion-row {
+        display: grid;
+        gap: 6px;
+      }
+
+      .emotion-row-top {
+        font-size: 13px;
+      }
+
+      .emotion-track {
+        width: 100%;
+        height: 12px;
+        border-radius: 999px;
+        background: rgba(31, 41, 55, 0.1);
+        overflow: hidden;
+      }
+
+      .emotion-fill {
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #6ee7b7, #c46a3a);
+      }
+
+      .fatigue-score {
+        font-size: 34px;
+        line-height: 1;
+        letter-spacing: -0.05em;
+      }
+
+      .fatigue-level {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(196, 106, 58, 0.12);
+        color: var(--accent-strong);
+        font-size: 13px;
+      }
+
+      .hint {
+        font-size: 13px;
+        color: rgba(31, 41, 55, 0.74);
+      }
+
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="panel hero">
+        <h1>Emotion Streaming Test Frontend</h1>
+        <p>点击开始后，页面会采集摄像头帧，将 JPEG 字节流通过 websocket 发送到后端，并把返回的人脸框叠加到视频上。同时会把每次返回的情绪概率和疲劳派生指标显示在页面中。</p>
+      </section>
+
+      <section class="layout">
+        <div class="panel stage">
+          <div class="video-shell">
+            <video id="preview" autoplay playsinline muted></video>
+            <canvas id="overlay"></canvas>
+          </div>
+          <div class="controls">
+            <button id="startButton">开始测试</button>
+            <button id="stopButton" disabled>停止</button>
+            <span class="badge"><span id="statusDot" class="dot"></span><span id="statusText">未连接</span></span>
+          </div>
+        </div>
+
+        <aside class="panel sidebar">
+          <div class="meta">
+            <div><strong>WebSocket</strong><div id="socketUrl"></div></div>
+            <div><strong>最近帧</strong><div id="frameInfo">尚未收到推理结果</div></div>
+            <div><strong>提示</strong><div class="hint">控制台会输出情绪概率和疲劳派生指标。建议先启动后端，再打开这个页面。</div></div>
+          </div>
+          <div class="emotion-panel">
+            <div class="section-title"><span>Emotion Probabilities</span><span>Per face</span></div>
+            <div id="emotionBars"></div>
+          </div>
+          <div class="fatigue-panel">
+            <div class="section-title"><span>Fatigue Metrics</span><span>Windowed</span></div>
+            <div id="fatiguePanel"></div>
+          </div>
+          <pre id="jsonView">等待推理结果...</pre>
+        </aside>
+      </section>
+    </main>
+
+    <script>
+      const preview = document.getElementById('preview');
+      const overlay = document.getElementById('overlay');
+      const overlayContext = overlay.getContext('2d');
+      const startButton = document.getElementById('startButton');
+      const stopButton = document.getElementById('stopButton');
+      const statusDot = document.getElementById('statusDot');
+      const statusText = document.getElementById('statusText');
+      const socketUrlElement = document.getElementById('socketUrl');
+      const frameInfoElement = document.getElementById('frameInfo');
+      const emotionBarsElement = document.getElementById('emotionBars');
+      const fatiguePanelElement = document.getElementById('fatiguePanel');
+      const jsonView = document.getElementById('jsonView');
+
+      const captureCanvas = document.createElement('canvas');
+      const captureContext = captureCanvas.getContext('2d', { willReadFrequently: false });
+      const websocketUrl = new URLSearchParams(window.location.search).get('ws') || `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/infer`;
+      const CAPTURE_INTERVAL_MS = 80;
+      const CAPTURE_MAX_WIDTH = 640;
+
+      let mediaStream = null;
+      let websocket = null;
+      let captureTimerId = null;
+      let latestFaces = [];
+      let lastCaptureWidth = 0;
+      let lastCaptureHeight = 0;
+
+      socketUrlElement.textContent = websocketUrl;
+
+      function setStatus(label, isLive) {
+        statusText.textContent = label;
+        statusDot.classList.toggle('live', Boolean(isLive));
+      }
+
+      function resizeOverlay() {
+        const width = preview.videoWidth || preview.clientWidth;
+        const height = preview.videoHeight || preview.clientHeight;
+        if (!width || !height) {
+          return;
+        }
+
+        overlay.width = width;
+        overlay.height = height;
+        drawFaceRectangles();
+      }
+
+      function drawFaceRectangles() {
+        overlayContext.clearRect(0, 0, overlay.width, overlay.height);
+        overlayContext.lineWidth = Math.max(2, overlay.width / 240);
+        overlayContext.strokeStyle = '#6ee7b7';
+        overlayContext.fillStyle = '#6ee7b7';
+        overlayContext.font = `${Math.max(14, overlay.width / 38)}px IBM Plex Sans, sans-serif`;
+
+        const sourceWidth = lastCaptureWidth || overlay.width;
+        const sourceHeight = lastCaptureHeight || overlay.height;
+        const scaleX = sourceWidth > 0 ? overlay.width / sourceWidth : 1;
+        const scaleY = sourceHeight > 0 ? overlay.height / sourceHeight : 1;
+
+        for (const face of latestFaces) {
+          const rect = face.face_rect;
+          if (!rect || rect.x == null || rect.y == null || rect.width == null || rect.height == null) {
+            continue;
+          }
+
+          const mappedX = rect.x * scaleX;
+          const mappedY = rect.y * scaleY;
+          const mappedWidth = rect.width * scaleX;
+          const mappedHeight = rect.height * scaleY;
+          const mirroredX = overlay.width - mappedX - mappedWidth;
+
+          overlayContext.strokeRect(mirroredX, mappedY, mappedWidth, mappedHeight);
+          const label = face.top_emotion ? `${face.top_emotion} ${(face.probabilities?.[face.top_emotion] ?? 0).toFixed(3)}` : 'face';
+          const textY = mappedY > 20 ? mappedY - 8 : mappedY + mappedHeight + 22;
+          overlayContext.fillText(label, mirroredX, textY);
+        }
+      }
+
+      function updateJsonView(payload) {
+        jsonView.textContent = JSON.stringify(payload, null, 2);
+      }
+
+      function renderEmotionBars(payload) {
+        const faces = payload.faces || [];
+
+        if (!faces.length) {
+          emotionBarsElement.innerHTML = '<div class="hint">当前没有检测到人脸。</div>';
+          return;
+        }
+
+        emotionBarsElement.innerHTML = faces
+          .map((face) => {
+            const entries = Object.entries(face.probabilities || {});
+            const bars = entries.length
+              ? entries
+                  .map(([emotion, value]) => {
+                    const numericValue = Number.isFinite(value) ? value : 0;
+                    const percentage = Math.max(0, Math.min(100, numericValue * 100));
+                    return `
+                      <div class="emotion-row">
+                        <div class="emotion-row-top">
+                          <span>${emotion}</span>
+                          <span>${numericValue.toFixed(3)}</span>
+                        </div>
+                        <div class="emotion-track">
+                          <div class="emotion-fill" style="width: ${percentage}%"></div>
+                        </div>
+                      </div>
+                    `;
+                  })
+                  .join('')
+              : '<div class="hint">该人脸没有可用的情绪概率。</div>';
+
+            return `
+              <div class="emotion-face">
+                <div class="emotion-face-header">
+                  <span>Face #${face.face_index}</span>
+                  <span>${face.top_emotion ? `Top: ${face.top_emotion}` : 'Top: unknown'}</span>
+                </div>
+                <div class="emotion-bars">${bars}</div>
+              </div>
+            `;
+          })
+          .join('');
+      }
+
+      function renderFatiguePanel(payload) {
+        const fatigue = payload.fatigue;
+
+        if (!fatigue) {
+          fatiguePanelElement.innerHTML = '<div class="hint">等待疲劳指标...</div>';
+          return;
+        }
+
+        const metrics = [
+          { label: 'Fatigue score', valueText: `${Math.round((fatigue.fatigue_score ?? 0) * 100)}`, width: Math.max(0, Math.min(100, (fatigue.fatigue_score ?? 0) * 100)) },
+          { label: 'Blink rate / min', valueText: `${(fatigue.blink_rate_per_min ?? 0).toFixed(1)}`, width: Math.max(0, Math.min(100, ((fatigue.blink_rate_per_min ?? 0) / 30) * 100)) },
+          { label: 'Yawn rate / min', valueText: `${(fatigue.yawn_rate_per_min ?? 0).toFixed(1)}`, width: Math.max(0, Math.min(100, ((fatigue.yawn_rate_per_min ?? 0) / 8) * 100)) },
+          { label: 'Eye-closed ratio', valueText: `${((fatigue.eye_closed_ratio ?? 0) * 100).toFixed(1)}%`, width: Math.max(0, Math.min(100, (fatigue.eye_closed_ratio ?? 0) * 100)) },
+        ];
+
+        const arousalValue = fatigue.signals?.arousal;
+        if (Number.isFinite(arousalValue)) {
+          metrics.push({
+            label: 'Arousal',
+            valueText: arousalValue.toFixed(3),
+            width: Math.max(0, Math.min(100, ((arousalValue + 1) / 2) * 100)),
+          });
+        }
+
+        fatiguePanelElement.innerHTML = `
+          <div class="fatigue-card">
+            <div class="fatigue-summary">
+              <div>
+                <div class="fatigue-score">${Math.round((fatigue.fatigue_score ?? 0) * 100)}</div>
+                <div class="hint">0-100 fatigue score</div>
+              </div>
+              <div class="fatigue-level">${fatigue.fatigue_level || 'low'}</div>
+            </div>
+            <div class="hint">primary face #${fatigue.primary_face_index ?? '-'} · dominant emotion: ${fatigue.dominant_emotion || 'unknown'}</div>
+            <div class="metric-grid">${metrics.map((item) => `
+              <div class="emotion-row">
+                <div class="emotion-row-top">
+                  <span>${item.label}</span>
+                  <span>${item.valueText}</span>
+                </div>
+                <div class="emotion-track">
+                  <div class="emotion-fill" style="width: ${item.width}%"></div>
+                </div>
+              </div>
+            `).join('')}</div>
+          </div>
+        `;
+      }
+
+      function logEmotionProbabilities(payload) {
+        const summary = payload.faces.map((face) => ({
+          face_index: face.face_index,
+          face_score: face.face_score,
+          top_emotion: face.top_emotion,
+          probabilities: face.probabilities,
+        }));
+
+        console.log('emotion probabilities', {
+          frame_id: payload.frame_id,
+          faces: summary,
+        });
+      }
+
+      function handleInferencePayload(payload) {
+        if (payload.type === 'inference_result') {
+          latestFaces = payload.faces || [];
+          frameInfoElement.textContent = `frame_id=${payload.frame_id}, faces=${latestFaces.length}, queue_size=${payload.queue_size}`;
+          updateJsonView(payload);
+          renderEmotionBars(payload);
+          renderFatiguePanel(payload);
+          logEmotionProbabilities(payload);
+          drawFaceRectangles();
+          return;
+        }
+
+        if (payload.type === 'dropped_frames') {
+          console.warn('dropped frames', payload);
+          frameInfoElement.textContent = `窗口已满，丢弃帧: ${payload.dropped_frame_ids.join(', ')}`;
+          updateJsonView(payload);
+          emotionBarsElement.innerHTML = '<div class="hint">窗口已满，最新情绪柱状图会在新的推理结果到达后更新。</div>';
+          fatiguePanelElement.innerHTML = '<div class="hint">推理窗口已满，疲劳指标会在新结果到达后更新。</div>';
+          return;
+        }
+
+        console.warn('backend message', payload);
+        updateJsonView(payload);
+      }
+
+      async function sendCurrentFrame() {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN || !preview.videoWidth || !preview.videoHeight) {
+          return;
+        }
+
+        const scale = Math.min(1, CAPTURE_MAX_WIDTH / preview.videoWidth);
+        captureCanvas.width = Math.max(1, Math.round(preview.videoWidth * scale));
+        captureCanvas.height = Math.max(1, Math.round(preview.videoHeight * scale));
+        lastCaptureWidth = captureCanvas.width;
+        lastCaptureHeight = captureCanvas.height;
+        captureContext.drawImage(preview, 0, 0, captureCanvas.width, captureCanvas.height);
+
+        const blob = await new Promise((resolve) => {
+          captureCanvas.toBlob(resolve, 'image/jpeg', 0.82);
+        });
+
+        if (!blob) {
+          return;
+        }
+
+        const arrayBuffer = await blob.arrayBuffer();
+        websocket.send(arrayBuffer);
+      }
+
+      function startCaptureLoop() {
+        if (captureTimerId !== null) {
+          window.clearInterval(captureTimerId);
+        }
+
+        captureTimerId = window.setInterval(() => {
+          void sendCurrentFrame();
+        }, CAPTURE_INTERVAL_MS);
+      }
+
+      function stopCaptureLoop() {
+        if (captureTimerId !== null) {
+          window.clearInterval(captureTimerId);
+          captureTimerId = null;
+        }
+      }
+
+      async function start() {
+        if (mediaStream || websocket) {
+          return;
+        }
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: 'user',
+            width: { ideal: 960 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+
+        preview.srcObject = mediaStream;
+        await preview.play();
+        resizeOverlay();
+
+        websocket = new WebSocket(websocketUrl);
+        websocket.binaryType = 'arraybuffer';
+
+        websocket.addEventListener('open', () => {
+          setStatus('已连接', true);
+          startButton.disabled = true;
+          stopButton.disabled = false;
+          startCaptureLoop();
+        });
+
+        websocket.addEventListener('message', (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            handleInferencePayload(payload);
+          } catch (error) {
+            console.error('failed to parse backend payload', error);
+          }
+        });
+
+        websocket.addEventListener('close', () => {
+          setStatus('连接关闭', false);
+          stopCaptureLoop();
+          websocket = null;
+          startButton.disabled = false;
+          stopButton.disabled = true;
+        });
+
+        websocket.addEventListener('error', (error) => {
+          console.error('websocket error', error);
+          setStatus('连接异常', false);
+        });
+      }
+
+      function stop() {
+        stopCaptureLoop();
+
+        if (websocket) {
+          websocket.close();
+          websocket = null;
+        }
+
+        if (mediaStream) {
+          for (const track of mediaStream.getTracks()) {
+            track.stop();
+          }
+          mediaStream = null;
+        }
+
+        latestFaces = [];
+        frameInfoElement.textContent = '尚未收到推理结果';
+        updateJsonView({ status: 'stopped' });
+        drawFaceRectangles();
+        emotionBarsElement.innerHTML = '<div class="hint">等待推理结果...</div>';
+        fatiguePanelElement.innerHTML = '<div class="hint">等待疲劳指标...</div>';
+        setStatus('未连接', false);
+        startButton.disabled = false;
+        stopButton.disabled = true;
+      }
+
+      preview.addEventListener('loadedmetadata', resizeOverlay);
+      window.addEventListener('resize', resizeOverlay);
+      startButton.addEventListener('click', () => {
+        void start();
+      });
+      stopButton.addEventListener('click', stop);
+
+      updateJsonView({
+        websocket_url: websocketUrl,
+        note: 'Open DevTools console to inspect emotion probabilities and fatigue metrics.',
+      });
+      emotionBarsElement.innerHTML = '<div class="hint">等待推理结果...</div>';
+      fatiguePanelElement.innerHTML = '<div class="hint">等待疲劳指标...</div>';
+    </script>
+  </body>
+</html>

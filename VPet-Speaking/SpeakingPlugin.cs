@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using LinePutScript.Localization.WPF;
@@ -9,7 +10,7 @@ using ToolBar = VPet_Simulator.Core.ToolBar;
 namespace VPet.Plugin.Speaking
 {
     /// <summary>
-    /// 本地 F5-TTS 语音合成插件：DIY「说话」按钮，优先走 Fast_generating 常驻服务以降低延迟。
+    /// 本地 F5-TTS 语音合成插件：先出气泡，后台合成完立即播放，降低体感延迟。
     /// </summary>
     public class SpeakingPlugin : MainPlugin
     {
@@ -19,7 +20,6 @@ namespace VPet.Plugin.Speaking
 
         public SpeakingPlugin(IMainWindow mainwin) : base(mainwin) { }
 
-        /// <summary>必须与 info.lps 中 vupmod 名称一致。</summary>
         public override string PluginName => "VPet-Speaking";
 
         public override void LoadPlugin()
@@ -38,6 +38,22 @@ namespace VPet.Plugin.Speaking
             var voiceDir = Path.Combine(GraphCore.CachePath, "voice");
             if (!Directory.Exists(voiceDir))
                 Directory.CreateDirectory(voiceDir);
+
+            // 后台预热长连接，避免第一次说话多一次握手
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    if (_f5 != null && await _f5.PingAsync().ConfigureAwait(false))
+                        Console.WriteLine($"[VPet-Speaking] F5 预热成功 {_f5.Host}:{_f5.Port} nfe={_f5.NfeStep}");
+                    else
+                        Console.WriteLine("[VPet-Speaking] F5 服务未就绪（说话前请先 start_server.py）");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[VPet-Speaking] F5 预热失败: {ex.Message}");
+                }
+            });
         }
 
         public override void LoadDIY()
@@ -45,9 +61,6 @@ namespace VPet.Plugin.Speaking
             MW.Main.ToolBar.AddMenuButton(ToolBar.MenuType.DIY, "说话".Translate(), SpeakTestSample);
         }
 
-        /// <summary>
-        /// 按下「说话」：取测试样例 → 本地 F5 合成（失败再试讯飞）→ 气泡+语音。
-        /// </summary>
         private void SpeakTestSample()
         {
             if (_busy)
@@ -64,21 +77,25 @@ namespace VPet.Plugin.Speaking
             _busy = true;
             MW.Main.ToolBar.Visibility = Visibility.Collapsed;
 
+            // 体感优化：立刻出气泡+说话动画，不等待合成结束
+            MW.Main.SayRnd(text, force: true);
+
             Task.Run(async () =>
             {
+                var sw = Stopwatch.StartNew();
                 try
                 {
                     var (audio, ext, engine) = await SynthesizeWithFallbackAsync(text).ConfigureAwait(false);
                     var path = Path.Combine(
                         GraphCore.CachePath,
                         "voice",
-                        $"{engine}_{Math.Abs(text.GetHashCode()):X}.{ext}");
+                        $"{engine}_{DateTime.UtcNow.Ticks:X}.{ext}");
                     await File.WriteAllBytesAsync(path, audio).ConfigureAwait(false);
-                    Console.WriteLine($"[VPet-Speaking] {engine} 合成完成 -> {path} ({audio.Length} bytes)");
+                    Console.WriteLine(
+                        $"[VPet-Speaking] {engine} ready in {sw.ElapsedMilliseconds} ms -> {path} ({audio.Length} bytes)");
 
                     MW.Main.Dispatcher.Invoke(() =>
                     {
-                        MW.Main.SayRnd(text, force: true);
                         MW.Main.PlayVoice(new Uri(path));
                     });
                 }
@@ -91,7 +108,6 @@ namespace VPet.Plugin.Speaking
                              "\n\n请先启动本地服务:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
                             "VPet-Speaking",
                             MessageBoxIcon.Error);
-                        MW.Main.SayRnd(text, force: true);
                     });
                 }
                 finally
@@ -101,7 +117,6 @@ namespace VPet.Plugin.Speaking
             });
         }
 
-        /// <summary>优先本地 F5；连不上再回退讯飞（若已配置）。</summary>
         private async Task<(byte[] Audio, string Ext, string Engine)> SynthesizeWithFallbackAsync(string text)
         {
             try

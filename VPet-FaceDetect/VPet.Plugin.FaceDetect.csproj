@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>VPet.Plugin.FaceDetect</RootNamespace>
+    <AssemblyName>VPet.Plugin.FaceDetect</AssemblyName>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VPet-Simulator.Windows.Interface\VPet-Simulator.Windows.Interface.csproj" />
+  </ItemGroup>
+
+  <Target Name="DeployToMod" AfterTargets="Build">
+    <PropertyGroup>
+      <ModDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\mod\1400_VPet-FaceDetect</ModDir>
+      <ModPluginDir>$(ModDir)\plugin</ModPluginDir>
+      <BinModDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod\1400_VPet-FaceDetect</BinModDir>
+      <BinModPluginDir>$(BinModDir)\plugin</BinModPluginDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(ModPluginDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\1400_VPet-FaceDetect\info.lps" DestinationFolder="$(ModDir)" SkipUnchangedFiles="true" />
+    <MakeDir Directories="$(BinModPluginDir)" Condition="Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows') And !Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod')" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BinModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(BinModPluginDir)')" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\1400_VPet-FaceDetect\info.lps" DestinationFolder="$(BinModDir)" SkipUnchangedFiles="true" Condition="Exists('$(BinModDir)')" />
+  </Target>
+</Project>

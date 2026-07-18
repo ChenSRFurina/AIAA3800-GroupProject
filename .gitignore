@@ -361,3 +361,33 @@ VPet-Simulator.Windows/mod/1112_DoingDisplay
 ###新加的gitignore都放这里
 VPet-Speaking/xunfei.config
 **/xunfei.config
+
+# --- Secrets / local env ---
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# --- Build outputs (must compile locally after clone) ---
+# VisualStudio.gitignore already covers [Bb]in/ [Oo]bj/; also ignore deployed plugin binaries
+VPet-Simulator.Windows/mod/**/plugin/*.dll
+VPet-Simulator.Windows/mod/**/plugin/*.pdb
+**/bin/
+**/obj/
+
+# --- Python / uv local envs ---
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.pyc
+
+# --- Local model weights & HF caches (download yourself) ---
+**/*.safetensors
+**/*.pt
+**/*.pth
+**/.cache/
+VPet-Speaking/Local_model/model/F5TTS_*/
+VPet-Speaking/Local_model/F5-TTS/Fast_generating/outputs/
+VPet-Speaking/Local_model/F5-TTS/Fast_generating/temp/
+audio/models/
+audio/backend/work_dir/

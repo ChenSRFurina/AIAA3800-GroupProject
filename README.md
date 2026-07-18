@@ -1,173 +1,243 @@
-# VPet-Simulator
+# AIAA3800 — VPet 多模态桌宠
 
-简体中文 | [繁體中文](./README_zht.md) | [English](./README_en.md) | [日本語](./README_ja.md)
+基于 [VPet](https://github.com/LorisYounger/VPet) 的二次开发：本地 TTS、视线跟随、人脸情绪/疲劳、语音助手。
 
-虚拟桌宠模拟器 一个开源的桌宠软件, 可以内置到任何WPF应用程序
+仓库：[ChenSRFurina/AIAA3800-GroupProject](https://github.com/ChenSRFurina/AIAA3800-GroupProject.git)
 
-![主图](README.assets/%E4%B8%BB%E5%9B%BE.png)
+目标平台：**Windows 10/11 x64**
 
-获取虚拟桌宠模拟器 [OnSteam(免费)](https://store.steampowered.com/app/1920960/VPet) 或 通过[Nuget](https://www.nuget.org/packages/VPet-Simulator.Core)内置到你的WPF应用程序
+---
 
-## 虚拟桌宠模拟器 详细介绍
+## 功能与端口
 
-虚拟桌宠模拟器是一款桌宠软件,支持各种互动投喂等. 开源免费并且支持创意工坊.
+| 模块 | 目录 | 端口 | Conda / 环境 |
+|------|------|------|----------------|
+| Speaking（F5-TTS） | `VPet-Speaking` | TCP `8765` | conda `F5TTS` |
+| Gaze（视线） | `VPet-Gaze` | HTTP `8766` | conda `F5TTS` |
+| FaceDetect | `face-detect` + `VPet-FaceDetect` | HTTP/WS `8000` | conda `FACE` |
+| Audio（语音助手） | `audio` + `VPet-Audio` | HTTP `8010` | `audio/backend/.venv`（`setup.bat`） |
 
-反正免费为啥不试试呢(
+C# 插件编译后自动部署到 `VPet-Simulator.Windows/mod/12xx~15xx_*/plugin/`。  
+**仓库不提交** `.env`、`bin/obj`、插件 `*.dll`、模型权重；克隆后需本地配置并编译。
 
-该游戏为 [虚拟主播模拟器](https://store.steampowered.com/app/1352140/_/) 内置桌宠(教程)程序独立而来, 如果喜欢的话欢迎添加 [虚拟主播模拟器](https://store.steampowered.com/app/1352140/_/) 至愿望单
+---
 
-### 超多的互动和动画
+## 1. 克隆
 
-多达 32(种) * 4(状态) * 3(类型) 种动画, *注:部分种类没有生病状态或循环等内容,实际动画数量会偏少*
+```powershell
+git clone https://github.com/ChenSRFurina/AIAA3800.git
+cd AIAA3800
+```
 
-#### 一些动画例子:
+---
 
-##### 摸头
+## 2. 配置环境变量（`.env`）
 
-![ss0](README.assets/ss0.gif)
+1. 复制模板：
 
-##### 提起
+```powershell
+copy .env.example .env
+```
 
-![ss4](README.assets/ss4.gif)![ss4](README.assets/ss8.gif)
+2. 编辑根目录 `.env`（**不要提交到 Git**）：
 
-##### 爬墙
+```env
+## audio（必填才能启动语音助手 Agent）
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+DEBUG=true
 
-![ss7](README.assets/ss7.gif)
+## 讯飞（可选；本地 F5-TTS 可用时可留空）
+XUNFEI_APPID=
+XUNFEI_APISecret=
+XUNFEI_APIKey=
+```
 
-### 免费
+DeepSeek Key：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
 
-该游戏完全免费! 反正不要钱,试试不要紧(<br/>
-该游戏主要目的是宣传下 [虚拟主播模拟器](https://store.steampowered.com/app/1352140/_/), 这是虚拟主播模拟器里面的桌宠.
+`audio` 后端会从 **仓库根目录** `VPet/.env`（即本仓库根 `.env`）读取 `DEEPSEEK_API_KEY`。
 
-### 开源
+---
 
-该游戏在github上开源, 欢迎提出自己的想法,创意或者参与开发!<br/>
-您还可以修改代码来制作自己专属的桌宠!(虽然说大部分内容都支持创意工坊,不需要修改代码)<br/>
-项目地址: https://github.com/LorisYounger/VPet
+## 3. 安装工具与 Python 环境
 
-### 支持创意工坊
+### 3.1 必装
 
-该游戏支持创意工坊,您可以制作别的人物桌宠动画或者互动,并上传至创意工坊分享给更多人使用.
+- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- [Git](https://git-scm.com/)
+- [Miniconda / Anaconda](https://docs.conda.io/)
+- Python 依赖按模块用 conda / uv 安装（见下）
 
-MOD制作器:  https://github.com/LorisYounger/VPet.ModMaker
+```powershell
+dotnet --version   # >= 8
+conda --version
+```
 
-创意工坊支持添加/修改以下内容
+### 3.2 Speaking + Gaze → conda `F5TTS`
 
-* 桌宠动画
-* 物品/食物/饮料等
-* 自定义桌宠工作
-* 说话文本
-* 主题
-* 代码插件 - 通过编写代码给桌宠添加内容
-  * 添加新的动画逻辑/显示方案 (eg: l2d/spine 等)
-  * 添加新功能 (闹钟/记事板等等)
-  * 几乎无所不能, 示例例子参见 [VPet.Plugin.Demo](https://github.com/LorisYounger/VPet.Plugin.Demo)
+```powershell
+conda create -n F5TTS python=3.11 -y
+conda activate F5TTS
+conda install ffmpeg -y
 
+# F5-TTS（需完整 Local_model/F5-TTS，含 src；见各模块 README）
+cd VPet-Speaking\Local_model\F5-TTS
+pip install -e .
 
-### 反馈&建议&联系我们
+# Gaze：必须 mediapipe==0.10.21（新版本无 mp.solutions）
+cd ..\..\..\VPet-Gaze
+pip install -r requirements.txt
+```
 
-如果有建议或者意见,可以在Steam商店评论/社区,Github Issue,虚拟主播模拟器贴吧,虚拟桌宠模拟器MODDer群(907101442)或者邮件联系我 [mailto:service@exlb.net](mailto:service@exlb.net)
+### 3.3 FaceDetect → conda `FACE`
 
-## 软件结构
+```powershell
+cd face-detect
+.\setup.bat
+# 或：conda create -n FACE python=3.13 -y
+#     conda activate FACE
+#     pip install -r requirements.txt
+```
 
-* **VPet-Simulator.Windows: 适用于桌面端的虚拟桌宠模拟器**
-  * *Function 功能性代码存放位置*
-    * CoreMOD Mod管理类
-    * MWController 窗体控制器
-  
-  * *WinDesign 窗口和UI设计
-    * winBetterBuy 更好买窗口
-    * winCGPTSetting ChatGPT 设置
-    * winSetting 软件设置/MOD 窗口
-    * winConsole 开发控制台
-    * winGameSetting 游戏设置
-    * winReport 反馈中心
-  
-  * MainWindows 主窗体,存放和展示Core
-  * PetHelper 快速切换小标
-* **VPet-Simulator.Tool: 方便制作MOD的工具(eg:图片帧生成)**
-* **VPet-Simulator.Core: 软件核心 方便内置到任何WPF应用程序(例如:VUP-Simulator)**
-  * Handle 接口与控件
-    * IController 窗体控制器 (调用相关功能和设置,例如移动到侧边等)
-    * Function 通用功能
-    * GameCore 游戏核心,包含各种数据等内容
-    * GameSave 游戏存档
-    * IFood 食物/物品接口
-    * PetLoader 宠物图形加载器
-  * Graph 图形渲染
-    * IGraph 动画基本接口
-    * GraphCore 动画显示核心
-    * GraphHelper 动画帮助类
-    * GraphInfo 动画信息
-    * FoodAnimation 食物动画 支持显示前中后3层夹心动画 不一定只用于食物,只是叫这个名字
-    * PNGAnimation 桌宠动态动画组件
-    * Picture 桌宠静态动画组件
-  * Display 显示
-    * basestyle/Theme 基本风格主题
-    * Main.xaml 核心显示部件
-      * MainDisplay 核心显示方法
-      * MainLogic 核心显示逻辑
-    * ToolBar 点击人物时候的工具栏
-    * MessageBar 人物说话时候的说话栏
-    * WorkTimer 工作时钟
+国内下载模型默认走镜像 `HF_ENDPOINT=https://hf-mirror.com`（`face-detect/run_backend.bat` / `server.py` 已处理）。
 
-## 参与开发
+### 3.4 Audio → `uv` + `.venv`
 
-欢迎参与虚拟桌宠模拟器的开发! 为保证代码可维护度和游戏性,如果想要开发新的功能,请先[邮件联系](mailto:zoujin.dev@exlb.org)或发[Issues](https://github.com/LorisYounger/VPet/issues)我想要添加的功能/玩法, 以确保该功能/玩法适用于虚拟桌宠模拟器. 以免未来提交时因不合适被拒(而造成代码浪费)<br/>
-如果是修复错误或者BUG,无需联系我,修好后直接PR即可
+```powershell
+cd audio
+.\setup.bat
+# 会在 audio\backend\.venv 安装依赖；请确保根目录 .env 已填 DEEPSEEK_API_KEY
+```
 
-当想法通过后,您可以通过 [fork](https://github.com/LorisYounger/VPet/fork) 功能拷贝代码至自己的github以方便编写自己的代码, 编写完毕后通过[pull requests](https://github.com/LorisYounger/VPet/compare) 提交<br/>
-如果您想法没有被通过,也可以另起炉灶,写个不同版本功能的桌宠软件. 但需遵守 [Apache License 2.0](https://github.com/LorisYounger/VPet/blob/main/LICENSE) 与 [动画版权声明与授权](https://github.com/LorisYounger/VPet#%E5%8A%A8%E7%94%BB%E7%89%88%E6%9D%83%E5%A3%B0%E6%98%8E%E4%B8%8E%E6%8E%88%E6%9D%83)
-注: 一般来讲, 添加新功能都可以通过编写代码插件MOD实现, 详情请参见 [VPet.Plugin.Demo](https://github.com/LorisYounger/VPet.Plugin.Demo)
+---
 
-我可能会对您的提交的代码进行修改,删减等以确保该功能/玩法适用于虚拟桌宠模拟器.
+## 4. 编译（本地必做）
 
+在仓库根目录：
 
-感谢以下参与的开发和翻译人员
+```powershell
+dotnet build .\VPet.sln -c Debug -p:Platform=x64
+```
 
-<a href="https://github.com/LorisYounger/VPet/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=LorisYounger/VPet" />
-</a>
+成功后生成：
 
-和提供社区翻译和更多内容的创意工坊人员
+- 主程序：`VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\VPet-Simulator.Windows.exe`
+- 插件 DLL：`VPet-Simulator.Windows\mod\1200_VPet-Speaking\plugin\` 等
 
-## 动画版权声明与授权
+### 首次运行：链接 mod（管理员）
 
-在github中 [桌宠动画文件](https://github.com/LorisYounger/VPet/tree/main/VPet-Simulator.Windows/mod/0000_core/pet/vup) 动画版权归 [虚拟主播模拟器制作组](https://www.exlb.net/VUP-Simulator)所有, 当使用本类库时,您可能需要自行准备动画文件,或遵循以下协议
+```powershell
+cd VPet-Simulator.Windows
+.\mklink.bat
+```
 
-> **注 **
-> 本动画声明仅限于桌宠自带的动画, 若有画师/开发者画自己的动画适配给桌宠,并不遵循用本声明
+否则 Debug 输出目录找不到 Core 模组。
 
-### 非商用用途授权
+---
 
-* 需要向用户告知动画文件来源并提供访问 [该页面](https://github.com/LorisYounger/VPet) 的链接
-* 当您完成以上要求后,您可以免费使用动画文件
+## 5. 启动
 
-### 商用用途授权
+### 方式 A：一键（推荐）
 
-* 第一次使用时需弹窗并醒目的向用户告知动画文件来源并提供访问 [该页面](https://github.com/LorisYounger/VPet) 的链接
-* 在相应页面(用户可以快捷访问)向用户告知动画文件来源并提供访问 [该页面](https://github.com/LorisYounger/VPet) 的链接
+```powershell
+.\start-all.bat
+```
 
-* 禁止通过出售动画文件进行盈利
-* 请[邮件联系](mailto:zoujin.dev@exlb.org)我
-* 当您完成以上要求后,您可以免费使用动画文件
+会分别打开窗口启动四个后端 + 桌宠前端。  
+停止：`.\stop-all.bat`
 
-### 分发动画文件
+常用参数：
 
-* 需要告知以上所有授权信息
-* 需要提供访问 [该页面](https://github.com/LorisYounger/VPet) 的链接
-* 分发动画文件时禁止任何付费/收费行为
+```powershell
+.\start-all.bat -GazeMock          # 无摄像头测 Gaze
+.\start-all.bat -Device cpu        # F5 用 CPU
+.\start-all.bat -SkipAudio         # 跳过某后端
+.\start-all.bat -NoFrontend        # 只启后端
+```
 
-### 图片版权声明与授权
+环境约定（`start-all.ps1`）：
 
-* 程序内置图片 版权授权同上
-* Zip 照片图库禁止商用
+- Speaking / Gaze → conda `F5TTS`
+- FaceDetect → conda `FACE`
+- Audio → `audio\backend\.venv`
 
-## 桌面端部署方法
+### 方式 B：手动分窗
 
-1. 下载本项目, 通过VisualStudio打开 `VPet.sln` 文件
-2. 在生成栏中, 选择 位数为 `x64` 和生成项目为 `Vpet-Simulator.Windows`
-   ![image-20230208004330895](README.assets/image-20230208004330895.png)
-3. 点击启动, 如果一切正常则会报错 `缺少模组Core,无法启动桌宠`
-4. 以管理员身份运行 `mklink.bat`, 这会让mod文件链接到生成位置
-5. 再次点击启动即可正常运行
+```powershell
+# Speaking :8765
+conda activate F5TTS
+cd VPet-Speaking\Local_model\F5-TTS\Fast_generating
+python start_server.py --device cuda
+
+# Gaze :8766
+conda activate F5TTS
+cd VPet-Gaze\python
+python gaze_server.py
+# 或 mock: python gaze_server_mock.py
+
+# FaceDetect :8000
+conda activate FACE
+cd face-detect
+.\run_backend.bat
+
+# Audio :8010
+cd audio\backend
+.\.venv\Scripts\python.exe main.py
+
+# 前端
+.\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\VPet-Simulator.Windows.exe
+```
+
+### 游戏内
+
+1. **设置 → MOD**：启用 `VPet-Speaking` / `VPet-Gaze` / `VPet-FaceDetect` / `VPet-Audio`
+2. 重启桌宠
+3. 右键 → **自定 / DIY** 使用各功能
+
+Debug 可加载未签名插件；Release 可能需开启「通过模组 / PassMOD」。
+
+---
+
+## 6. 验证清单
+
+| 检查 | 地址 / 命令 |
+|------|-------------|
+| FaceDetect | `http://127.0.0.1:8000/health` |
+| Face 测试页 | `http://127.0.0.1:8000/test-frontend/` |
+| Gaze | `http://127.0.0.1:8766/gaze` |
+| Audio | `http://127.0.0.1:8010/health` |
+| Speaking | `start_server.py` 窗口无报错、监听 `8765` |
+
+---
+
+## 7. 常见问题
+
+| 现象 | 处理 |
+|------|------|
+| 缺少 Core 模组 | 管理员运行 `mklink.bat` |
+| DIY 无按钮 | MOD 中启用并重启；确认已 `dotnet build` |
+| Gaze `mp.solutions` 报错 | `pip install mediapipe==0.10.21` |
+| FaceDetect 下载模型 10054 | 用 `run_backend.bat`（HF 镜像）；或设 `HF_ENDPOINT=https://hf-mirror.com` |
+| Audio 缺 `DEEPSEEK_API_KEY` | 填写根目录 `.env` |
+| 端口占用 | Speaking `8765` / Gaze `8766` / Face `8000` / Audio `8010` 勿冲突 |
+
+---
+
+## 8. 目录速览
+
+```text
+AIAA3800/
+├─ README.md                 ← 本文
+├─ .env.example              ← 环境变量模板（复制为 .env）
+├─ .gitignore
+├─ VPet.sln
+├─ start-all.bat / start-all.ps1 / stop-all.bat
+├─ VPet-Simulator.Windows/   ← 主程序
+├─ VPet-Speaking/            ← F5-TTS 插件 + 本地模型脚本
+├─ VPet-Gaze/                ← 视线插件 + Python
+├─ VPet-FaceDetect/          ← 人脸检测 C# 桥接
+├─ VPet-Audio/               ← 语音助手 C# 桥接
+├─ face-detect/              ← 人脸 Python 后端
+└─ audio/                    ← 语音助手 Python 后端
+```
+
+更细的模块说明见各子目录 `README.md`。上游桌宠文档见官方 [LorisYounger/VPet](https://github.com/LorisYounger/VPet)。

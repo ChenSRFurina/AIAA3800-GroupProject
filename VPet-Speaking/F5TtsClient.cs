@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
 using System.Text;
@@ -6,15 +8,18 @@ using System.Text.Json;
 namespace VPet.Plugin.Speaking
 {
     /// <summary>
-    /// 本地 F5-TTS Fast_generating 客户端。
-    /// 连接 start_server.py 常驻服务（模型与参考音色已加载），低延迟合成 WAV。
+    /// 本地 F5-TTS 客户端：长连接复用，避免每次说话都重新 TCP 握手。
     /// </summary>
-    public sealed class F5TtsClient
+    public sealed class F5TtsClient : IDisposable
     {
         private readonly string _host;
         private readonly int _port;
         private readonly int _nfeStep;
         private readonly int _timeoutMs;
+        private readonly object _ioLock = new();
+        private TcpClient? _client;
+        private NetworkStream? _stream;
+        private bool _disposed;
 
         public F5TtsClient(string host = "127.0.0.1", int port = 8765, int nfeStep = 8, int timeoutMs = 30000)
         {
@@ -28,71 +33,20 @@ namespace VPet.Plugin.Speaking
         public int Port => _port;
         public int NfeStep => _nfeStep;
 
-        /// <summary>
-        /// 合成语音，返回可直接给 MediaPlayer 播放的 WAV 字节。
-        /// </summary>
-        public async Task<byte[]> SynthesizeAsync(string text, CancellationToken cancellationToken = default)
+        /// <summary>预热长连接（插件加载时调用）。</summary>
+        public async Task WarmupAsync(CancellationToken cancellationToken = default)
         {
-            if (string.IsNullOrWhiteSpace(text))
-                throw new ArgumentException("合成文本不能为空", nameof(text));
-
-            using var client = new TcpClient();
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(_timeoutMs);
-
-            try
-            {
-                await client.ConnectAsync(_host, _port, timeoutCts.Token).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
-            {
-                throw new InvalidOperationException(
-                    $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/F5-TTS/Fast_generating/start_server.py",
-                    ex);
-            }
-
-            client.NoDelay = true;
-            await using var stream = client.GetStream();
-
-            var req = new Dictionary<string, object?>
-            {
-                ["cmd"] = "gen",
-                ["text"] = text.Trim(),
-                ["nfe_step"] = _nfeStep,
-            };
-            await SendJsonAsync(stream, req, timeoutCts.Token).ConfigureAwait(false);
-
-            using var metaDoc = await RecvJsonAsync(stream, timeoutCts.Token).ConfigureAwait(false);
-            var root = metaDoc.RootElement;
-            if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
-            {
-                var err = root.TryGetProperty("error", out var e) ? e.GetString() : "未知错误";
-                throw new InvalidOperationException($"F5-TTS 合成失败: {err}");
-            }
-
-            var sr = root.TryGetProperty("sr", out var srProp) ? srProp.GetInt32() : 24000;
-            var pcm = await RecvBytesAsync(stream, timeoutCts.Token).ConfigureAwait(false);
-            if (pcm.Length == 0)
-                throw new InvalidOperationException("F5-TTS 未返回音频数据");
-
-            return Float32PcmToWav(pcm, sr);
+            await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+            // ping 确认服务就绪，并让服务端线程保持住这条连接
+            await SendReceivePingAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        /// <summary>探测服务是否就绪。</summary>
         public async Task<bool> PingAsync(CancellationToken cancellationToken = default)
         {
             try
             {
-                using var client = new TcpClient();
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                cts.CancelAfter(Math.Min(_timeoutMs, 3000));
-                await client.ConnectAsync(_host, _port, cts.Token).ConfigureAwait(false);
-                client.NoDelay = true;
-                await using var stream = client.GetStream();
-                await SendJsonAsync(stream, new Dictionary<string, object?> { ["cmd"] = "ping" }, cts.Token)
-                    .ConfigureAwait(false);
-                using var doc = await RecvJsonAsync(stream, cts.Token).ConfigureAwait(false);
-                return doc.RootElement.TryGetProperty("ok", out var ok) && ok.GetBoolean();
+                await WarmupAsync(cancellationToken).ConfigureAwait(false);
+                return true;
             }
             catch
             {
@@ -100,9 +54,69 @@ namespace VPet.Plugin.Speaking
             }
         }
 
-        /// <summary>
-        /// 从插件旁 f5tts.config 加载；不存在则使用默认 127.0.0.1:8765。
-        /// </summary>
+        /// <summary>合成语音，返回 WAV 字节。</summary>
+        public async Task<byte[]> SynthesizeAsync(string text, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                throw new ArgumentException("合成文本不能为空", nameof(text));
+
+            var sw = Stopwatch.StartNew();
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(_timeoutMs);
+            var ct = timeoutCts.Token;
+
+            // 最多重试一次（长连接可能被服务端关掉）
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    await EnsureConnectedAsync(ct).ConfigureAwait(false);
+                    var stream = _stream ?? throw new InvalidOperationException("F5 连接未建立");
+
+                    var req = new Dictionary<string, object?>
+                    {
+                        ["cmd"] = "gen",
+                        ["text"] = text.Trim(),
+                        ["nfe_step"] = _nfeStep,
+                    };
+
+                    byte[] wav;
+                    lock (_ioLock)
+                    {
+                        // 同步 IO 保证长连接请求不交错；耗时主要在服务端 GPU
+                        SendJson(stream, req);
+                        using var metaDoc = RecvJson(stream);
+                        var root = metaDoc.RootElement;
+                        if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
+                        {
+                            var err = root.TryGetProperty("error", out var e) ? e.GetString() : "未知错误";
+                            throw new InvalidOperationException($"F5-TTS 合成失败: {err}");
+                        }
+
+                        var sr = root.TryGetProperty("sr", out var srProp) ? srProp.GetInt32() : 24000;
+                        var inferMs = root.TryGetProperty("infer_ms", out var im) ? im.GetDouble() : -1;
+                        var pcm = RecvBytes(stream);
+                        if (pcm.Length == 0)
+                            throw new InvalidOperationException("F5-TTS 未返回音频数据");
+
+                        wav = Float32PcmToWav(pcm, sr);
+                        Console.WriteLine(
+                            $"[VPet-Speaking] F5 infer_ms={inferMs} client_ms={sw.ElapsedMilliseconds} nfe={_nfeStep} bytes={wav.Length}");
+                    }
+
+                    return wav;
+                }
+                catch (Exception ex) when (attempt == 0 && ex is IOException or SocketException or ObjectDisposedException)
+                {
+                    Console.WriteLine($"[VPet-Speaking] F5 连接中断，重连重试: {ex.Message}");
+                    DropConnection();
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/F5-TTS/Fast_generating/start_server.py");
+        }
+
         public static F5TtsClient FromConfigNearAssembly()
         {
             var dir = Path.GetDirectoryName(typeof(F5TtsClient).Assembly.Location)
@@ -129,79 +143,126 @@ namespace VPet.Plugin.Speaking
             return new F5TtsClient(host, port, nfe, timeout);
         }
 
-        private static async Task SendJsonAsync(
-            NetworkStream stream,
-            Dictionary<string, object?> obj,
-            CancellationToken cancellationToken)
+        private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
         {
-            var json = JsonSerializer.Serialize(obj);
-            var payload = Encoding.UTF8.GetBytes(json);
-            var header = BitConverter.GetBytes(payload.Length); // little-endian on Windows
-            await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
-            await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
+            if (_client is { Connected: true } && _stream is not null)
+                return;
+
+            DropConnection();
+            var client = new TcpClient { NoDelay = true };
+            try
+            {
+                await client.ConnectAsync(_host, _port, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
+            {
+                client.Dispose();
+                throw new InvalidOperationException(
+                    $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/F5-TTS/Fast_generating/start_server.py",
+                    ex);
+            }
+
+            _client = client;
+            _stream = client.GetStream();
+            Console.WriteLine($"[VPet-Speaking] F5 长连接已建立 {_host}:{_port}");
         }
 
-        private static async Task<JsonDocument> RecvJsonAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private async Task SendReceivePingAsync(CancellationToken cancellationToken)
         {
-            var payload = await RecvBytesAsync(stream, cancellationToken).ConfigureAwait(false);
+            await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+            var stream = _stream!;
+            lock (_ioLock)
+            {
+                SendJson(stream, new Dictionary<string, object?> { ["cmd"] = "ping" });
+                using var doc = RecvJson(stream);
+                if (!doc.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+                    throw new InvalidOperationException("F5 ping 失败");
+            }
+        }
+
+        private void DropConnection()
+        {
+            try { _stream?.Dispose(); } catch { /* ignore */ }
+            try { _client?.Dispose(); } catch { /* ignore */ }
+            _stream = null;
+            _client = null;
+        }
+
+        private static void SendJson(NetworkStream stream, Dictionary<string, object?> obj)
+        {
+            var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(obj));
+            Span<byte> header = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
+            stream.Write(header);
+            stream.Write(payload);
+        }
+
+        private static JsonDocument RecvJson(NetworkStream stream)
+        {
+            var payload = RecvBytes(stream);
             return JsonDocument.Parse(payload);
         }
 
-        private static async Task<byte[]> RecvBytesAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private static byte[] RecvBytes(NetworkStream stream)
         {
-            var header = await ReadExactAsync(stream, 4, cancellationToken).ConfigureAwait(false);
-            var length = BitConverter.ToInt32(header, 0);
+            Span<byte> header = stackalloc byte[4];
+            ReadExact(stream, header);
+            var length = BinaryPrimitives.ReadInt32LittleEndian(header);
             if (length < 0 || length > 64 * 1024 * 1024)
                 throw new InvalidOperationException($"非法数据长度: {length}");
-            return await ReadExactAsync(stream, length, cancellationToken).ConfigureAwait(false);
+            var buffer = new byte[length];
+            ReadExact(stream, buffer);
+            return buffer;
         }
 
-        private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int count, CancellationToken cancellationToken)
+        private static void ReadExact(NetworkStream stream, Span<byte> buffer)
         {
-            var buffer = new byte[count];
             var offset = 0;
-            while (offset < count)
+            while (offset < buffer.Length)
             {
-                var read = await stream.ReadAsync(buffer.AsMemory(offset, count - offset), cancellationToken)
-                    .ConfigureAwait(false);
+                var read = stream.Read(buffer[offset..]);
                 if (read == 0)
                     throw new IOException("连接已断开");
                 offset += read;
             }
-            return buffer;
         }
 
-        /// <summary>float32 PCM LE → 16-bit mono WAV。</summary>
+        /// <summary>float32 PCM LE → 16-bit mono WAV（快速路径）。</summary>
         private static byte[] Float32PcmToWav(byte[] floatPcm, int sampleRate)
         {
             var sampleCount = floatPcm.Length / 4;
             var dataBytes = sampleCount * 2;
-            using var ms = new MemoryStream(44 + dataBytes);
-            using var bw = new BinaryWriter(ms);
+            var wav = new byte[44 + dataBytes];
 
-            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
-            bw.Write(36 + dataBytes);
-            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
-            bw.Write(Encoding.ASCII.GetBytes("fmt "));
-            bw.Write(16);          // PCM chunk size
-            bw.Write((short)1);    // PCM
-            bw.Write((short)1);    // mono
-            bw.Write(sampleRate);
-            bw.Write(sampleRate * 2); // byte rate
-            bw.Write((short)2);    // block align
-            bw.Write((short)16);   // bits
-            bw.Write(Encoding.ASCII.GetBytes("data"));
-            bw.Write(dataBytes);
+            // header
+            Encoding.ASCII.GetBytes("RIFF").CopyTo(wav.AsSpan(0, 4));
+            BinaryPrimitives.WriteInt32LittleEndian(wav.AsSpan(4, 4), 36 + dataBytes);
+            Encoding.ASCII.GetBytes("WAVE").CopyTo(wav.AsSpan(8, 4));
+            Encoding.ASCII.GetBytes("fmt ").CopyTo(wav.AsSpan(12, 4));
+            BinaryPrimitives.WriteInt32LittleEndian(wav.AsSpan(16, 4), 16);
+            BinaryPrimitives.WriteInt16LittleEndian(wav.AsSpan(20, 2), 1);
+            BinaryPrimitives.WriteInt16LittleEndian(wav.AsSpan(22, 2), 1);
+            BinaryPrimitives.WriteInt32LittleEndian(wav.AsSpan(24, 4), sampleRate);
+            BinaryPrimitives.WriteInt32LittleEndian(wav.AsSpan(28, 4), sampleRate * 2);
+            BinaryPrimitives.WriteInt16LittleEndian(wav.AsSpan(32, 2), 2);
+            BinaryPrimitives.WriteInt16LittleEndian(wav.AsSpan(34, 2), 16);
+            Encoding.ASCII.GetBytes("data").CopyTo(wav.AsSpan(36, 4));
+            BinaryPrimitives.WriteInt32LittleEndian(wav.AsSpan(40, 4), dataBytes);
 
-            for (var i = 0; i + 3 < floatPcm.Length; i += 4)
+            var floats = new float[sampleCount];
+            Buffer.BlockCopy(floatPcm, 0, floats, 0, sampleCount * 4);
+            var outOffset = 44;
+            for (var i = 0; i < sampleCount; i++)
             {
-                var sample = BitConverter.ToSingle(floatPcm, i);
+                var sample = floats[i];
                 if (sample > 1f) sample = 1f;
-                if (sample < -1f) sample = -1f;
-                bw.Write((short)Math.Round(sample * 32767.0));
+                else if (sample < -1f) sample = -1f;
+                var s = (short)(sample * 32767f);
+                BinaryPrimitives.WriteInt16LittleEndian(wav.AsSpan(outOffset, 2), s);
+                outOffset += 2;
             }
 
-            return ms.ToArray();
+            return wav;
         }
 
         private static Dictionary<string, string> ParseConfig(string path)
@@ -217,6 +278,13 @@ namespace VPet.Plugin.Speaking
                 dict[line[..idx].Trim()] = line[(idx + 1)..].Trim();
             }
             return dict;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            DropConnection();
         }
     }
 }

@@ -1,0 +1,4 @@
+vupmod#VPet-Gaze:|author#AIAA3800 Project Team:|gamever#11049:|ver#100:|
+intro#通过本地视线追踪服务控制桌宠平滑移动:|
+lang#en:|通过本地视线追踪服务控制桌宠平滑移动#Move the desktop pet smoothly using a local gaze-tracking service:|VPet-Gaze#VPet Gaze Tracking:|启动视线跟随#Start gaze following:|停止视线跟随#Stop gaze following:|视线跟随已经启动啦。#Gaze following is already running.:|视线跟随已启动。#Gaze following started.:|视线跟随当前没有运行。#Gaze following is not running.:|视线跟随已停止。#Gaze following stopped.:|
+lang#zh-Hans:|通过本地视线追踪服务控制桌宠平滑移动#通过本地视线追踪服务控制桌宠平滑移动:|VPet-Gaze#视线跟随:|
