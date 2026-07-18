@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import deque
 from contextlib import asynccontextmanager
@@ -191,6 +192,35 @@ async def chat(request: Request):
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+@app.post("/chat/reply")
+async def chat_reply(request: Request):
+    """
+    同步对话接口（供 VPet-Speaking 等客户端取完整回复再做 TTS）。
+
+    请求体: {"message": "用户输入"}
+    响应: {"ok": true, "reply": "...", "message": "..."}
+    """
+    body = await request.json()
+    user_input = (body.get("message") or "").strip()
+    if not user_input:
+        return {"ok": False, "error": "消息不能为空", "reply": ""}
+
+    if agent_instance is None:
+        return {"ok": False, "error": "Agent 未初始化", "reply": ""}
+
+    try:
+        # agent.run 为同步阻塞调用，放到线程池避免卡住事件循环
+        reply = await asyncio.to_thread(agent_instance.run, user_input)
+        reply_text = (reply or "").strip()
+        return {
+            "ok": True,
+            "message": user_input,
+            "reply": reply_text,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "reply": ""}
 
 
 # ── 语音相关接口 ────────────────────────────────────────────────────────

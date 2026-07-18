@@ -80,69 +80,17 @@ public sealed class AudioPlugin : MainPlugin
 
     private void StartPolling()
     {
-        if (_pollCts is { IsCancellationRequested: false })
-        {
-            MW.Main.SayRnd("语音轮询已在运行。".Translate(), force: true);
-            return;
-        }
-
-        _pollCts = new CancellationTokenSource();
-        var token = _pollCts.Token;
-        Task.Run(() => PollLoopAsync(token), token);
-        MW.Main.SayRnd("开始轮询语音消息。".Translate(), force: true);
+        // LLM 助手回复由 VPet-Speaking 自动轮询 /voice/messages 并 TTS，避免双端抢队列
+        MW.Main.SayRnd(
+            "LLM 回复语音由 VPet-Speaking 自动播放，请保持 Speaking 插件启用；此处无需轮询。".Translate(),
+            force: true);
     }
 
     private void StopPolling()
     {
         _pollCts?.Cancel();
         _pollCts = null;
-        MW.Main.SayRnd("已停止轮询语音消息。".Translate(), force: true);
-    }
-
-    private async Task PollLoopAsync(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                var json = await _http.GetStringAsync($"{BaseUrl}/voice/messages", token).ConfigureAwait(false);
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("messages", out var msgs) &&
-                    msgs.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var msg in msgs.EnumerateArray())
-                    {
-                        var type = msg.TryGetProperty("type", out var t) ? t.GetString() : "";
-                        var content = msg.TryGetProperty("content", out var c) ? c.GetString() : "";
-                        if (string.IsNullOrWhiteSpace(content))
-                            continue;
-
-                        // 助手回复显示在桌宠气泡
-                        if (string.Equals(type, "assistant", StringComparison.OrdinalIgnoreCase))
-                        {
-                            MW.Main.Dispatcher.Invoke(() => MW.Main.SayRnd(content!, force: true));
-                        }
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[VPet-Audio] poll error: {ex.Message}");
-            }
-
-            try
-            {
-                await Task.Delay(800, token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-        }
+        MW.Main.SayRnd("语音消息轮询已停止。".Translate(), force: true);
     }
 
     public override void EndGame()

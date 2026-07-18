@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
+using System.Text.Json;
 using System.Windows;
 using LinePutScript.Localization.WPF;
 using Panuon.WPF.UI;
@@ -10,13 +12,20 @@ using ToolBar = VPet_Simulator.Core.ToolBar;
 namespace VPet.Plugin.Speaking
 {
     /// <summary>
-    /// 本地 F5-TTS 语音合成插件：先出气泡，后台合成完立即播放，降低体感延迟。
+    /// DIY「说话」：固定调试文本 TTS。
+    /// 同时轮询 audio /voice/messages：LLM 助手回复到达后自动合成并播放。
     /// </summary>
     public class SpeakingPlugin : MainPlugin
     {
+        private const string AudioBaseUrl = "http://127.0.0.1:8010";
+
         private F5TtsClient? _f5;
         private XunfeiTtsClient? _xunfei;
-        private bool _busy;
+        private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
+        private CancellationTokenSource? _replyPollCts;
+        private bool _busyDebugSpeak;
+        private bool _busyLlmSpeak;
+        private int _pollFailCount;
 
         public SpeakingPlugin(IMainWindow mainwin) : base(mainwin) { }
 
@@ -39,7 +48,6 @@ namespace VPet.Plugin.Speaking
             if (!Directory.Exists(voiceDir))
                 Directory.CreateDirectory(voiceDir);
 
-            // 后台预热长连接，避免第一次说话多一次握手
             _ = Task.Run(async () =>
             {
                 try
@@ -54,50 +62,35 @@ namespace VPet.Plugin.Speaking
                     Console.WriteLine($"[VPet-Speaking] F5 预热失败: {ex.Message}");
                 }
             });
+
+            // 自动轮询 audio LLM 回复 → TTS（模拟对话）
+            _replyPollCts = new CancellationTokenSource();
+            _ = Task.Run(() => PollAudioRepliesAsync(_replyPollCts.Token));
+            Console.WriteLine("[VPet-Speaking] 已启动 audio LLM 回复轮询 → 自动 TTS");
         }
 
         public override void LoadDIY()
         {
-            MW.Main.ToolBar.AddMenuButton(ToolBar.MenuType.DIY, "说话".Translate(), SpeakTestSample);
+            MW.Main.ToolBar.AddMenuButton(ToolBar.MenuType.DIY, "说话".Translate(), SpeakDebugFixed);
         }
 
-        private void SpeakTestSample()
+        /// <summary>DIY 调试：固定合成「好无聊啊，和我聊聊天吧」。</summary>
+        private void SpeakDebugFixed()
         {
-            if (_busy)
+            if (_busyDebugSpeak || _busyLlmSpeak)
                 return;
 
-            var text = GetMessage.get_message(GetMessage.TestSample);
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                MessageBoxX.Show("没有可合成的文本".Translate(), "VPet-Speaking");
-                return;
-            }
-
+            var text = GetMessage.ChatPrompt;
             _f5 ??= F5TtsClient.FromConfigNearAssembly();
-            _busy = true;
+            _busyDebugSpeak = true;
             MW.Main.ToolBar.Visibility = Visibility.Collapsed;
-
-            // 体感优化：立刻出气泡+说话动画，不等待合成结束
             MW.Main.SayRnd(text, force: true);
 
             Task.Run(async () =>
             {
-                var sw = Stopwatch.StartNew();
                 try
                 {
-                    var (audio, ext, engine) = await SynthesizeWithFallbackAsync(text).ConfigureAwait(false);
-                    var path = Path.Combine(
-                        GraphCore.CachePath,
-                        "voice",
-                        $"{engine}_{DateTime.UtcNow.Ticks:X}.{ext}");
-                    await File.WriteAllBytesAsync(path, audio).ConfigureAwait(false);
-                    Console.WriteLine(
-                        $"[VPet-Speaking] {engine} ready in {sw.ElapsedMilliseconds} ms -> {path} ({audio.Length} bytes)");
-
-                    MW.Main.Dispatcher.Invoke(() =>
-                    {
-                        MW.Main.PlayVoice(new Uri(path));
-                    });
+                    await SynthesizeAndPlayAsync(text, "debug").ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -105,16 +98,113 @@ namespace VPet.Plugin.Speaking
                     {
                         MessageBoxX.Show(
                             ("语音合成失败: ".Translate() + ex.Message +
-                             "\n\n请先启动本地服务:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
+                             "\n\n请先启动:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
                             "VPet-Speaking",
                             MessageBoxIcon.Error);
                     });
                 }
                 finally
                 {
-                    _busy = false;
+                    _busyDebugSpeak = false;
                 }
             });
+        }
+
+        /// <summary>轮询 audio 的 LLM 助手回复，到达后气泡 + TTS。</summary>
+        private async Task PollAudioRepliesAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    var json = await _http.GetStringAsync($"{AudioBaseUrl}/voice/messages", token)
+                        .ConfigureAwait(false);
+                    _pollFailCount = 0;
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("messages", out var msgs) &&
+                        msgs.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var msg in msgs.EnumerateArray())
+                        {
+                            var type = msg.TryGetProperty("type", out var t) ? t.GetString() : "";
+                            var content = msg.TryGetProperty("content", out var c) ? c.GetString() : "";
+                            if (string.IsNullOrWhiteSpace(content))
+                                continue;
+
+                            if (!string.Equals(type, "assistant", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            await HandleLlmReplyAsync(content!, token).ConfigureAwait(false);
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _pollFailCount++;
+                    if (_pollFailCount == 1 || _pollFailCount % 50 == 0)
+                        Console.WriteLine($"[VPet-Speaking] poll audio replies: {ex.Message}");
+                }
+
+                try
+                {
+                    await Task.Delay(600, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private async Task HandleLlmReplyAsync(string reply, CancellationToken token)
+        {
+            // 避免与 debug「说话」或上一条 LLM TTS 重叠
+            while ((_busyDebugSpeak || _busyLlmSpeak) && !token.IsCancellationRequested)
+                await Task.Delay(200, token).ConfigureAwait(false);
+
+            if (token.IsCancellationRequested)
+                return;
+
+            _busyLlmSpeak = true;
+            try
+            {
+                Console.WriteLine($"[VPet-Speaking] LLM reply → TTS: {reply}");
+                MW.Main.Dispatcher.Invoke(() => MW.Main.SayRnd(reply, force: true));
+                await SynthesizeAndPlayAsync(reply, "llm").ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[VPet-Speaking] LLM TTS 失败: {ex.Message}");
+                MW.Main.Dispatcher.Invoke(() =>
+                    MW.Main.SayRnd(("语音合成失败: ".Translate() + ex.Message), force: true));
+            }
+            finally
+            {
+                _busyLlmSpeak = false;
+            }
+        }
+
+        private async Task SynthesizeAndPlayAsync(string text, string tag)
+        {
+            var sw = Stopwatch.StartNew();
+            var (audio, ext, engine) = await SynthesizeWithFallbackAsync(text).ConfigureAwait(false);
+            var path = Path.Combine(
+                GraphCore.CachePath,
+                "voice",
+                $"{tag}_{engine}_{DateTime.UtcNow.Ticks:X}.{ext}");
+            await File.WriteAllBytesAsync(path, audio).ConfigureAwait(false);
+            Console.WriteLine(
+                $"[VPet-Speaking] {tag}/{engine} ready in {sw.ElapsedMilliseconds} ms -> {path} ({audio.Length} bytes)");
+
+            MW.Main.Dispatcher.Invoke(() => MW.Main.PlayVoice(new Uri(path)));
         }
 
         private async Task<(byte[] Audio, string Ext, string Engine)> SynthesizeWithFallbackAsync(string text)
@@ -145,6 +235,13 @@ namespace VPet.Plugin.Speaking
                 var mp3 = await _xunfei.SynthesizeAsync(text).ConfigureAwait(false);
                 return (mp3, "mp3", "xunfei");
             }
+        }
+
+        public override void EndGame()
+        {
+            _replyPollCts?.Cancel();
+            _replyPollCts = null;
+            _http.Dispose();
         }
     }
 }

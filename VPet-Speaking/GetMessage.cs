@@ -1,16 +1,16 @@
 namespace VPet.Plugin.Speaking
 {
     /// <summary>
-    /// 对应 get_message.py 的测试样例入口。
+    /// DIY「说话」调试用固定文本（合成播放，不调用 LLM）。
     /// </summary>
     public static class GetMessage
     {
-        /// <summary>测试样例文本（短句，便于本地 F5 低延迟合成）。</summary>
-        public const string TestSample = "你好，我是太乙真人。";
+        /// <summary>点击「说话」时固定合成的调试文本。</summary>
+        public const string ChatPrompt = "好无聊啊，和我聊聊天吧";
 
-        /// <summary>
-        /// 获取要合成的文本。当前直接返回传入内容；后续可在此接入 LLM / 对话逻辑。
-        /// </summary>
+        /// <summary>兼容旧命名。</summary>
+        public const string TestSample = ChatPrompt;
+
         public static string get_message(string? message)
         {
             try
