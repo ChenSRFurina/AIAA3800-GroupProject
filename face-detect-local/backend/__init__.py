@@ -1,0 +1,1 @@
+"""Backend package for face-detect-local websocket inference."""

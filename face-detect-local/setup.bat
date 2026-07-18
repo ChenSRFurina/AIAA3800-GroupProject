@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 echo.
 echo ====================================================
-echo   FaceDetect env setup [conda FACE]
+echo   FaceDetect-local env setup [conda FACE]
 echo ====================================================
 echo.
 
@@ -40,7 +40,8 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [完成] 环境 FACE 已就绪。
-echo   启动: cd backend ^& python server.py
+echo   模型: 将 RetinaFace 放到 model\model.safetensors
+echo   启动: run_backend.bat
 echo   测试: http://127.0.0.1:8000/test-frontend/
 echo.
 pause

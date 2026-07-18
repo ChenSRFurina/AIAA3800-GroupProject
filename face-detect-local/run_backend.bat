@@ -5,9 +5,10 @@ cd /d "%~dp0backend"
 
 echo.
 echo ====================================================
-echo   FaceDetect backend :8000  [conda FACE]
+echo   FaceDetect-local backend :8000  [conda FACE]
 echo ====================================================
-echo   HF mirror: https://hf-mirror.com
+echo   Local models: ..\model\  (retinaface: model.safetensors)
+echo   HF mirror  : https://hf-mirror.com  (multitask fallback)
 echo   Test page: http://127.0.0.1:8000/test-frontend/
 echo.
 

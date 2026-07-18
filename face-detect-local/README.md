@@ -12,11 +12,12 @@ This project provides a FastAPI backend that accepts JPEG frame bytes over WebSo
 - `backend/infer.py`: JPEG decode + `Detectorv2` inference + signal extraction
 - `backend/fatigue.py`: Temporal fatigue monitor (blink/yawn/fatigue score)
 - `test-frontend/index.html`: Browser test page (camera + WebSocket)
-- `setup.sh`: Dependency installation helper
+- `model/`: bundled py-feat weights (see `model/README.md`)
+- `backend/local_models.py`: prefer local weights before Hugging Face Hub
 
 ## 2. Start Backend (Conda env `aiaa3800`)
 
-From project root (`face-detect`):
+From project root (`face-detect-local`):
 
 ```bash
 conda create -n aiaa3800 python=3.13
@@ -34,6 +35,10 @@ Optional environment variables:
 - `INFER_SERVER_PORT` (default `8000`)
 - `MAX_INFER_WINDOW_SIZE` (default `8`)
 - `FEAT_DEVICE` (default `cuda`, falls back to CPU if CUDA unavailable)
+- `FEAT_LOCAL_MODEL_DIR` (default `../model`)
+- `FEAT_MULTITASK_WEIGHTS` (optional path to local multitask checkpoint)
+
+Place `model.safetensors` (RetinaFace) under `model/` to avoid downloading from Hugging Face. Multitask weights can stay on Hub (mirror via `HF_ENDPOINT`) or be added as `model/face_multitask_v2.safetensors`.
 
 Health check:
 

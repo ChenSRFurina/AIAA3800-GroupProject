@@ -271,7 +271,7 @@ async def voice_toggle(request: Request):
 
 
 if __name__ == "__main__":
-    # 默认 8010，避免与 face-detect:8000 冲突；可用 AUDIO_PORT 覆盖
+    # 默认 8010，避免与 face-detect-local:8000 冲突；可用 AUDIO_PORT 覆盖
     port = int(os.getenv("AUDIO_PORT", "8010"))
     uvicorn.run(
         app,

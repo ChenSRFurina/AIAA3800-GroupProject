@@ -8,11 +8,11 @@ using ToolBar = VPet_Simulator.Core.ToolBar;
 namespace VPet.Plugin.Audio;
 
 /// <summary>
-/// 语音助手桥接插件：对接 audio/backend（默认 http://127.0.0.1:8010，避免与 face-detect:8000 冲突）。
+/// 语音助手桥接插件：对接 audio/backend（默认 http://127.0.0.1:8010，避免与 face-detect-local:8000 冲突）。
 /// </summary>
 public sealed class AudioPlugin : MainPlugin
 {
-    // face-detect 占用 8000；语音服务建议: uvicorn --port 8010
+    // face-detect-local 占用 8000；语音服务建议: uvicorn --port 8010
     private const string BaseUrl = "http://127.0.0.1:8010";
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
     private CancellationTokenSource? _pollCts;

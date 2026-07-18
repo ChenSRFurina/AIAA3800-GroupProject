@@ -7,7 +7,7 @@ using ToolBar = VPet_Simulator.Core.ToolBar;
 namespace VPet.Plugin.FaceDetect;
 
 /// <summary>
-/// 人脸检测桥接插件：对接 face-detect Python 后端（默认 http://127.0.0.1:8000）。
+/// 人脸检测桥接插件：对接 face-detect-local Python 后端（默认 http://127.0.0.1:8000）。
 /// </summary>
 public sealed class FaceDetectPlugin : MainPlugin
 {
@@ -39,7 +39,7 @@ public sealed class FaceDetectPlugin : MainPlugin
                 MW.Main.Dispatcher.Invoke(() =>
                     MW.Main.SayRnd(
                         ("人脸检测服务未启动: ".Translate() + ex.Message +
-                         "\n请先运行 face-detect/backend/server.py"),
+                         "\n请先运行 face-detect-local/run_backend.bat"),
                         force: true));
             }
         });

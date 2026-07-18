@@ -6,6 +6,8 @@ param(
     [switch]$SkipAudio,
     [switch]$NoFrontend,
     [switch]$GazeMock,
+    [switch]$Remote,
+    [string]$FaceRemoteUrl = "",
     [ValidateSet("cuda", "cpu")]
     [string]$Device = "cuda",
     [switch]$Release
@@ -23,6 +25,31 @@ $AudioVenvPython = Join-Path $Root "audio\backend\.venv\Scripts\python.exe"
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn([string]$msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
+
+function Read-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+    if (-not (Test-Path -LiteralPath $FilePath)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $FilePath -Encoding UTF8) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+        if ($trimmed -match '^\s*([^=]+)=(.*)$') {
+            $name = $matches[1].Trim()
+            if ($name -ne $Key) { continue }
+            $value = $matches[2].Trim()
+            if (
+                ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                ($value.StartsWith("'") -and $value.EndsWith("'"))
+            ) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            return $value
+        }
+    }
+    return $null
+}
 
 function Get-CondaBase {
     if ($env:CONDA_ROOT -and (Test-Path -LiteralPath $env:CONDA_ROOT)) { return $env:CONDA_ROOT }
@@ -136,6 +163,11 @@ Write-Host "===================================================="
 Write-Host "  VPet one-click start (backends + frontend)"
 Write-Host "===================================================="
 Write-Host ("  Root : {0}" -f $Root)
+if ($Remote) {
+    Write-Host "  Face : REMOTE relay on :8000 (no local infer)"
+} else {
+    Write-Host "  Face : LOCAL face-detect-local on :8000"
+}
 Write-Host "  Ports: Speaking 8765 | Gaze 8766 | Face 8000 | Audio 8010"
 Write-Host "  Envs : Speaking/Gaze -> conda F5TTS | Face -> conda FACE | Audio -> audio\backend\.venv"
 Write-Host ""
@@ -164,14 +196,37 @@ if (-not $SkipGaze) {
 }
 
 if (-not $SkipFaceDetect) {
-    $wd = Join-Path $Root "face-detect\backend"
-    $launch = Build-CondaLaunch -EnvName $CondaEnvFace -OverridePath $env:VPET_FACE_PYTHON `
-        -ScriptArgs "server.py"
-    Write-Ok ("FaceDetect env: {0}" -f $launch.Source)
-    # HF_ENDPOINT：国内下载 py-feat 模型用镜像，避免 WinError 10054
-    $faceCmd = 'set HF_ENDPOINT=https://hf-mirror.com& ' + $launch.CommandLine
-    Start-BackendWindow -Title "VPet-FaceDetect :8000" -WorkingDir $wd `
-        -CommandLine $faceCmd | Out-Null
+    if ($Remote) {
+        $remoteUrl = $FaceRemoteUrl
+        if (-not $remoteUrl) {
+            $remoteUrl = Read-DotEnvValue -FilePath (Join-Path $Root ".env") -Key "FACE_REMOTE_URL"
+        }
+        if (-not $remoteUrl) {
+            $remoteUrl = $env:FACE_REMOTE_URL
+        }
+        if (-not $remoteUrl) {
+            Write-Warn "Remote mode: set FACE_REMOTE_URL in .env or pass -FaceRemoteUrl http://host:8000"
+            Write-Step "Skip FaceDetect relay"
+        } else {
+            $wd = Join-Path $Root "face-detect-remote\backend"
+            $launch = Build-CondaLaunch -EnvName $CondaEnvFace -OverridePath $env:VPET_FACE_PYTHON `
+                -ScriptArgs "relay.py"
+            Write-Ok ("FaceDetect relay env: {0}" -f $launch.Source)
+            Write-Ok ("FaceDetect remote target: {0}" -f $remoteUrl)
+            $faceCmd = ('set FACE_REMOTE_URL=' + $remoteUrl + '& ') + $launch.CommandLine
+            Start-BackendWindow -Title "VPet-FaceDetect RELAY :8000" -WorkingDir $wd `
+                -CommandLine $faceCmd | Out-Null
+        }
+    } else {
+        $wd = Join-Path $Root "face-detect-local\backend"
+        $launch = Build-CondaLaunch -EnvName $CondaEnvFace -OverridePath $env:VPET_FACE_PYTHON `
+            -ScriptArgs "server.py"
+        Write-Ok ("FaceDetect local env: {0}" -f $launch.Source)
+        # HF_ENDPOINT：multitask 权重未放本地时用镜像，避免 WinError 10054
+        $faceCmd = 'set HF_ENDPOINT=https://hf-mirror.com& ' + $launch.CommandLine
+        Start-BackendWindow -Title "VPet-FaceDetect LOCAL :8000" -WorkingDir $wd `
+            -CommandLine $faceCmd | Out-Null
+    }
 } else {
     Write-Step "Skip FaceDetect"
 }

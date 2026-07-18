@@ -14,7 +14,8 @@
 |------|------|------|----------------|
 | Speaking（F5-TTS） | `VPet-Speaking` | TCP `8765` | conda `F5TTS` |
 | Gaze（视线） | `VPet-Gaze` | HTTP `8766` | conda `F5TTS` |
-| FaceDetect | `face-detect` + `VPet-FaceDetect` | HTTP/WS `8000` | conda `FACE` |
+| FaceDetect（本地） | `face-detect-local` + `VPet-FaceDetect` | HTTP/WS `8000` | conda `FACE` |
+| FaceDetect（远程） | `face-detect-remote` relay + 远端 GPU 服务器 | 本地 `:8000` → 远程 | conda `FACE`（仅 relay） |
 | Audio（语音助手） | `audio` + `VPet-Audio` | HTTP `8010` | `audio/backend/.venv`（`setup.bat`） |
 
 C# 插件编译后自动部署到 `VPet-Simulator.Windows/mod/12xx~15xx_*/plugin/`。  
@@ -91,14 +92,15 @@ pip install -r requirements.txt
 ### 3.3 FaceDetect → conda `FACE`
 
 ```powershell
-cd face-detect
+cd face-detect-local
 .\setup.bat
+# 将 RetinaFace 权重放到 face-detect-local\model\model.safetensors（见 model\README.md）
 # 或：conda create -n FACE python=3.13 -y
 #     conda activate FACE
 #     pip install -r requirements.txt
 ```
 
-国内下载模型默认走镜像 `HF_ENDPOINT=https://hf-mirror.com`（`face-detect/run_backend.bat` / `server.py` 已处理）。
+RetinaFace 默认读本地 `face-detect-local/model/model.safetensors`；multitask 权重未放本地时走镜像 `HF_ENDPOINT=https://hf-mirror.com`（`face-detect-local/run_backend.bat` / `server.py`）。
 
 ### 3.4 Audio → `uv` + `.venv`
 
@@ -157,8 +159,17 @@ cd VPet-Simulator.Windows
 环境约定（`start-all.ps1`）：
 
 - Speaking / Gaze → conda `F5TTS`
-- FaceDetect → conda `FACE`
+- FaceDetect（默认）→ `face-detect-local` + conda `FACE`
+- FaceDetect（`-Remote`）→ `face-detect-remote` relay，不跑本地推理
 - Audio → `audio\backend\.venv`
+
+**远程人脸检测**（本机无 GPU / 模型在服务器上）：
+
+1. 在 GPU 服务器上部署并启动 `face-detect-remote\run_backend.bat`（原版推理服务）
+2. 本机 `.env` 填写：`FACE_REMOTE_URL=http://服务器IP:8000`
+3. 本机启动：`.\start-all.bat -Remote`
+
+relay 仍监听本机 `127.0.0.1:8000`，VPet 与测试页无需改地址。
 
 ### 方式 B：手动分窗
 
@@ -174,10 +185,16 @@ cd VPet-Gaze\python
 python gaze_server.py
 # 或 mock: python gaze_server_mock.py
 
-# FaceDetect :8000
+# FaceDetect :8000（本地）
 conda activate FACE
-cd face-detect
+cd face-detect-local
 .\run_backend.bat
+
+# FaceDetect :8000（远程 relay，推理在 GPU 服务器）
+# .env: FACE_REMOTE_URL=http://192.168.1.10:8000
+conda activate FACE
+cd face-detect-remote
+.\run_relay.bat
 
 # Audio :8010
 cd audio\backend
@@ -216,7 +233,8 @@ Debug 可加载未签名插件；Release 可能需开启「通过模组 / PassMO
 | 缺少 Core 模组 | 管理员运行 `mklink.bat` |
 | DIY 无按钮 | MOD 中启用并重启；确认已 `dotnet build` |
 | Gaze `mp.solutions` 报错 | `pip install mediapipe==0.10.21` |
-| FaceDetect 下载模型 10054 | 用 `run_backend.bat`（HF 镜像）；或设 `HF_ENDPOINT=https://hf-mirror.com` |
+| FaceDetect 下载模型 10054 | 本地模式：RetinaFace 放 `face-detect-local/model/`；远程模式：GPU 服务器跑 `face-detect-remote/run_backend.bat` |
+| FaceDetect 远程连不上 | 检查 `FACE_REMOTE_URL`、防火墙、GPU 服务器 `http://IP:8000/health` |
 | Audio 缺 `DEEPSEEK_API_KEY` | 填写根目录 `.env` |
 | 端口占用 | Speaking `8765` / Gaze `8766` / Face `8000` / Audio `8010` 勿冲突 |
 
@@ -236,7 +254,8 @@ AIAA3800/
 ├─ VPet-Gaze/                ← 视线插件 + Python
 ├─ VPet-FaceDetect/          ← 人脸检测 C# 桥接
 ├─ VPet-Audio/               ← 语音助手 C# 桥接
-├─ face-detect/              ← 人脸 Python 后端
+├─ face-detect-local/        ← 本地推理（model/ 权重）
+├─ face-detect-remote/       ← 远端 GPU 服务器 + 本机 relay
 └─ audio/                    ← 语音助手 Python 后端
 ```
 
