@@ -15,14 +15,32 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# audio/backend/memory
-DEFAULT_MEMORY_DIR = Path(__file__).resolve().parents[1] / "memory"
+# 长期记忆固定落盘目录：VPet/audio/backend/memory（绝对路径，与 cwd 无关）
+DEFAULT_MEMORY_DIR = (Path(__file__).resolve().parents[1] / "memory").resolve()
 _DEFAULT_USER_ID = "default"
 
 
 def _ts_iso(ts: float) -> str:
     """Unix 时间戳 → 本地可读 ISO 字符串（方便打开 JSON 查看）。"""
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ts_date(ts: float) -> str:
+    """Unix 时间戳 → 本地日期 YYYY-MM-DD。"""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+_DATE_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}\]\s*")
+
+
+def _strip_date_prefix(text: str) -> str:
+    return _DATE_PREFIX_RE.sub("", (text or "").strip())
+
+
+def _format_memory_line(entry: "MemoryEntry") -> str:
+    """Prompt / 展示用：统一带日期，避免 content 里已有日期时重复。"""
+    body = _strip_date_prefix(entry.content)
+    return f"- [{_ts_date(entry.created_at)}] {body}（{entry.category}，{entry.importance.name}）"
 
 
 def _parse_ts(data: dict, key: str, iso_key: str) -> float:
@@ -133,7 +151,11 @@ class LayeredMemoryManager:
         default_user_id: str = _DEFAULT_USER_ID,
         autosave: bool = True,
     ):
-        self.storage_dir = Path(storage_dir) if storage_dir else DEFAULT_MEMORY_DIR
+        self.storage_dir = (
+            Path(storage_dir).expanduser().resolve()
+            if storage_dir
+            else DEFAULT_MEMORY_DIR
+        )
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.default_user_id = default_user_id
         self.autosave = autosave
@@ -144,6 +166,7 @@ class LayeredMemoryManager:
         self._lock = threading.RLock()
         self._profiles_loaded = False
 
+        logger.info("长期记忆目录: %s", self.storage_dir)
         self._load_profiles()
 
     # ── path helpers ────────────────────────────────────────────────────
@@ -203,6 +226,7 @@ class LayeredMemoryManager:
         uid = self._safe_user_id(user_id)
         self._ensure_loaded(uid)
         now = time.time()
+        path = self._user_path(uid)
         payload = {
             "user_id": uid,
             "updated_at": now,
@@ -210,7 +234,9 @@ class LayeredMemoryManager:
             "count": len(self._memories.get(uid, [])),
             "memories": [m.to_dict() for m in self._memories.get(uid, [])],
         }
-        self._atomic_write(self._user_path(uid), payload)
+        self._atomic_write(path, payload)
+        logger.info("长期记忆已写入: %s (count=%d)", path, payload["count"])
+        print(f"[Memory] 已保存到 {path} (共 {payload['count']} 条)")
 
     @staticmethod
     def _atomic_write(path: Path, data: Any) -> None:
@@ -475,8 +501,8 @@ class LayeredMemoryManager:
             return None
 
         category, importance = self._classify_utterance(text)
-        # 统一格式，便于 prompt / JSON 阅读
-        content = f"用户说：{text}"
+        # 统一格式：带日期，便于 prompt / JSON 按时间阅读
+        content = f"[{_ts_date(time.time())}] 用户说：{text}"
         return self.store(
             user_id,
             content,
@@ -504,9 +530,7 @@ class LayeredMemoryManager:
         memories = self.retrieve(user_id, current_topic=topic, limit=limit)
         if not memories:
             return "暂无历史信息"
-        return "\n".join(
-            f"- {m.content}（{m.category}，{m.importance.name}）" for m in memories
-        )
+        return "\n".join(_format_memory_line(m) for m in memories)
 
     def list_users(self) -> List[str]:
         users = {p.stem for p in self.storage_dir.glob("*.json") if p.name != "profiles.json"}
@@ -539,10 +563,7 @@ class PersonaAwareResponder:
     ) -> str:
         if memory_text is None:
             memories = memories or []
-            memory_text = "\n".join(
-                f"- {m.content}（{m.category}，{m.importance.name}）"
-                for m in memories[:5]
-            )
+            memory_text = "\n".join(_format_memory_line(m) for m in memories[:5])
 
         tools_block = ""
         if tools_prompt and tools_prompt.strip():

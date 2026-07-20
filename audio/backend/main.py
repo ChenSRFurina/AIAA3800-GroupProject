@@ -22,6 +22,7 @@ from learn_agent.agent.agent import Agent
 from learn_agent.llm import DeepSeek
 from learn_agent.memory import Memory
 from learn_agent.character_setting import (
+    DEFAULT_MEMORY_DIR,
     LayeredMemoryManager,
     PersonaAwareResponder,
     PersonaConfig,
@@ -152,9 +153,12 @@ async def lifespan(app: FastAPI):
             "获取: https://platform.deepseek.com/api_keys"
         )
 
-    memory_dir = Path(__file__).resolve().parent / "memory"
+    # 固定写入 VPet/audio/backend/memory/{user_id}.json（绝对路径）
+    memory_dir = DEFAULT_MEMORY_DIR
+    memory_dir.mkdir(parents=True, exist_ok=True)
     memory_manager = LayeredMemoryManager(storage_dir=memory_dir)
     print(f"[Memory] 长期记忆目录: {memory_dir}")
+    print(f"[Memory] 默认文件: {memory_dir / (DEFAULT_MEMORY_USER + '.json')}")
 
     agent_instance = Agent(
         session_id="web-session",
