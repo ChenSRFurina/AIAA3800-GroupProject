@@ -77,10 +77,19 @@ namespace VPet.Plugin.Speaking
         /// <summary>DIY 调试：固定合成「好无聊啊，和我聊聊天吧」。</summary>
         private void SpeakDebugFixed()
         {
+            SpeakExternal(GetMessage.ChatPrompt, showErrorDialog: true, tag: "debug");
+        }
+
+        /// <summary>
+        /// 供其他插件（如 VPet-Gaze 发呆提醒）调用：气泡 + F5/讯飞 TTS。
+        /// </summary>
+        public void SpeakExternal(string text, bool showErrorDialog = false, string tag = "external")
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return;
             if (_busyDebugSpeak || _busyLlmSpeak)
                 return;
 
-            var text = GetMessage.ChatPrompt;
             _f5 ??= F5TtsClient.FromConfigNearAssembly();
             _busyDebugSpeak = true;
             MW.Main.ToolBar.Visibility = Visibility.Collapsed;
@@ -90,18 +99,22 @@ namespace VPet.Plugin.Speaking
             {
                 try
                 {
-                    await SynthesizeAndPlayAsync(text, "debug").ConfigureAwait(false);
+                    await SynthesizeAndPlayAsync(text, tag).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    MW.Main.Dispatcher.Invoke(() =>
+                    Console.WriteLine($"[VPet-Speaking] SpeakExternal failed: {ex.Message}");
+                    if (showErrorDialog)
                     {
-                        MessageBoxX.Show(
-                            ("语音合成失败: ".Translate() + ex.Message +
-                             "\n\n请先启动:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
-                            "VPet-Speaking",
-                            MessageBoxIcon.Error);
-                    });
+                        MW.Main.Dispatcher.Invoke(() =>
+                        {
+                            MessageBoxX.Show(
+                                ("语音合成失败: ".Translate() + ex.Message +
+                                 "\n\n请先启动:\npython Local_model/F5-TTS/Fast_generating/start_server.py"),
+                                "VPet-Speaking",
+                                MessageBoxIcon.Error);
+                        });
+                    }
                 }
                 finally
                 {

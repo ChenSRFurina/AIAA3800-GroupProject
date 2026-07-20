@@ -69,3 +69,12 @@ F5TTS_TIMEOUT_MS=30000
 ## 回退
 
 若本地服务未启动，且存在 `xunfei.config`，会自动回退讯飞云端 TTS。
+
+## 更新记录
+
+### 2026-07-20
+
+- 新增 `SpeakExternal(string text, ...)`：供其他插件（如 **VPet-Gaze**）外部触发气泡 + TTS，无需点 DIY「说话」。
+- DIY「说话」改为调用 `SpeakExternal`，固定调试句「好无聊啊，和我聊聊天吧」。
+- 与 VPet-Gaze 联调：I-DT 判定注视约 3s → 桌宠恒速走/爬到注视点 → 到达后仍盯着则随机发呆台词经本插件合成播放。
+- Gaze 侧预览/服务端同步加 I-DT debug（触发注视后注视点变红，控制台打印 `FIXATION triggered`）；参数见 `VPet-Gaze/GazeConfig.cs`。

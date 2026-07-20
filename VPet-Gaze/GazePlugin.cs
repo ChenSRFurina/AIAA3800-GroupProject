@@ -46,7 +46,10 @@ public sealed class GazePlugin : MainPlugin
         }
 
         _trackingClient.Start();
-        MW.Main.SayRnd("视线跟随已启动。".Translate(), force: true);
+        MW.Main.SayRnd(
+            $"视线注视模式已启动：盯着一处约 {GazeConfig.FixationDurationSeconds:0.#} 秒我会走/爬过去哦。"
+                .Translate(),
+            force: true);
     }
 
     private void StopTracking()

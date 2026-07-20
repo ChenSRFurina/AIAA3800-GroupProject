@@ -10,6 +10,15 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI
 
+from gaze_model import (
+    KalmanGazeFilter,
+    RidgeGazeMapper,
+    build_nine_point_targets,
+    extract_gaze_features,
+    fit_ridge_mapper,
+    reset_head_pose_smoother,
+)
+
 
 # ============================================================
 # FastAPI
@@ -46,40 +55,54 @@ RIGHT_LOWER_LIDS = (374, 380, 373)
 
 CAMERA_INDEX = 0
 
-# 启动后中立视线校准时间
-CALIBRATION_SECONDS = 2.0
+# 九点校准（3×3）：中心 + 四边中点 + 四角
+CALIBRATION_MARGIN = 0.06
+CALIBRATION_SETTLE_SECONDS = 0.45
+CALIBRATION_CAPTURE_SECONDS = 1.05
+CALIBRATION_MIN_SAMPLES = 8
 
-# 水平方向的经验范围
-# 当前水平识别效果正常，因此继续沿用原有范围
-HORIZONTAL_MIN = 0.34
-HORIZONTAL_MAX = 0.66
+# 映射后屏幕空间死区（相对 [-1,1] 注视轴；过大→中心吸附并来回弹）
+SCREEN_DEADZONE = 0.02
 
-# 纵向灵敏度
-# 纵向放大倍数
-VERTICAL_GAIN = 18.0
-
-# 水平与纵向平滑参数
-# 数值越大，响应越快；数值越小，画面越稳定
-SMOOTHING_X = 0.25
-SMOOTHING_Y = 0.55
-
-# 视线死区，防止正视时轻微抖动
-HORIZONTAL_DEADZONE = 0.025
-VERTICAL_DEADZONE = 0.035
+# 输出端不再混几何点（几何只作 Ridge 特征），避免与校准符号打架来回晃
+GEO_BLEND = 0.0
 
 # 屏幕位置允许范围
-SCREEN_X_MIN = 0.03
-SCREEN_X_MAX = 0.97
+SCREEN_X_MIN = 0.0
+SCREEN_X_MAX = 1.0
+SCREEN_Y_MIN = 0.0
+SCREEN_Y_MAX = 1.0
 
-SCREEN_Y_MIN = 0.08
-SCREEN_Y_MAX = 0.92
+# 眼睛过度闭合时不更新视线（提高以避开半闭眼噪声）
+MIN_NORMALIZED_EYE_OPENNESS = 0.018
 
-# 纵向映射幅度
-# 0.5 表示 gaze_y=-1~1 会映射到屏幕中央上下约 50%
-VERTICAL_SCREEN_SCALE = 0.5
+# 全屏预览：按真实屏幕坐标画注视点，便于核对准不准
+PREVIEW_WINDOW_NAME = "VPet Gaze Preview"
+PREVIEW_START_FULLSCREEN = True
 
-# 眼睛过度闭合时不更新纵向视线
-MIN_NORMALIZED_EYE_OPENNESS = 0.010
+# I-DT 调试（与 C# GazeConfig 对齐，改这里即可）
+FIXATION_DURATION_SECONDS = 3.0
+IDT_DISPERSION_THRESHOLD = 0.08
+IDT_MIN_SAMPLE_COUNT = 8
+
+
+@dataclass(frozen=True)
+class CalibrationTarget:
+    name: str
+    screen_x: float
+    screen_y: float
+
+
+def build_calibration_targets(
+    margin: float = CALIBRATION_MARGIN,
+) -> list[CalibrationTarget]:
+    return [
+        CalibrationTarget(name, sx, sy)
+        for name, sx, sy in build_nine_point_targets(margin)
+    ]
+
+
+CALIBRATION_TARGETS = build_calibration_targets()
 
 
 # ============================================================
@@ -100,6 +123,12 @@ class SharedState:
     raw_x: float = 0.5
     raw_y: float = 0.5
 
+    # I-DT 调试：是否已触发注视判定
+    fixation: bool = False
+    fixation_duration: float = 0.0
+    fixation_x: float = 0.5
+    fixation_y: float = 0.5
+
     timestamp: float = 0.0
 
 
@@ -112,11 +141,269 @@ recalibration_requested = threading.Event()
 
 
 # ============================================================
+# I-DT（服务端调试用，与 C# 插件逻辑一致）
+# ============================================================
+
+class IdtFixationDetector:
+    """Identification by Dispersion Threshold（流式）。"""
+
+    def __init__(self) -> None:
+        self._window: list[tuple[float, float, float]] = []
+        self._triggered = False
+
+    def reset(self) -> None:
+        self._window.clear()
+        self._triggered = False
+
+    @staticmethod
+    def _dispersion(
+        points: list[tuple[float, float, float]],
+    ) -> float:
+        if not points:
+            return 0.0
+        xs = [p[1] for p in points]
+        ys = [p[2] for p in points]
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    def update(
+        self,
+        screen_x: float,
+        screen_y: float,
+        now: float,
+    ) -> tuple[bool, float, float, float]:
+        """
+        返回: (是否已达注视阈值, 持续秒数, 质心x, 质心y)
+        """
+        self._window.append((now, screen_x, screen_y))
+
+        while (
+            len(self._window) > 1
+            and self._dispersion(self._window) > IDT_DISPERSION_THRESHOLD
+        ):
+            self._window.pop(0)
+            self._triggered = False
+
+        while (
+            len(self._window) > 1
+            and now - self._window[0][0] > FIXATION_DURATION_SECONDS * 3.0
+        ):
+            self._window.pop(0)
+
+        if not self._window:
+            return False, 0.0, 0.5, 0.5
+
+        duration = now - self._window[0][0]
+        cx = sum(p[1] for p in self._window) / len(self._window)
+        cy = sum(p[2] for p in self._window) / len(self._window)
+
+        ok = (
+            len(self._window) >= IDT_MIN_SAMPLE_COUNT
+            and duration >= FIXATION_DURATION_SECONDS
+            and self._dispersion(self._window) <= IDT_DISPERSION_THRESHOLD
+        )
+
+        if ok and not self._triggered:
+            self._triggered = True
+            print(
+                "[VPet-Gaze][I-DT] FIXATION triggered "
+                f"dur={duration:.2f}s center=({cx:.3f}, {cy:.3f}) "
+                f"(threshold={FIXATION_DURATION_SECONDS}s)"
+            )
+
+        if not ok:
+            self._triggered = False
+
+        return ok, duration, cx, cy
+
+
+# ============================================================
 # 通用函数
 # ============================================================
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def get_primary_screen_size() -> tuple[int, int]:
+    """读取主显示器分辨率，用于全屏预览画布。"""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        width = int(user32.GetSystemMetrics(0))
+        height = int(user32.GetSystemMetrics(1))
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+
+    return 1920, 1080
+
+
+def set_preview_fullscreen(enabled: bool) -> None:
+    prop = (
+        cv2.WINDOW_FULLSCREEN
+        if enabled
+        else cv2.WINDOW_NORMAL
+    )
+    cv2.setWindowProperty(
+        PREVIEW_WINDOW_NAME,
+        cv2.WND_PROP_FULLSCREEN,
+        prop,
+    )
+
+
+def build_screen_preview(
+    screen_w: int,
+    screen_h: int,
+    camera_frame: np.ndarray | None,
+    *,
+    screen_x: float | None,
+    screen_y: float | None,
+    lines: list[tuple[str, tuple[int, int, int]]],
+    calibrating: bool = False,
+    calib_target: CalibrationTarget | None = None,
+    calib_done_names: set[str] | None = None,
+    marker_fixating: bool = False,
+) -> np.ndarray:
+    """
+    在真实屏幕坐标系上绘制注视点。
+    screen_x/screen_y 为 0~1，(0,0)=左上，(1,1)=右下。
+    """
+    canvas = np.full((screen_h, screen_w, 3), 28, dtype=np.uint8)
+    cx = screen_w // 2
+    cy = screen_h // 2
+    done_names = calib_done_names or set()
+
+    if calibrating:
+        for target in CALIBRATION_TARGETS:
+            tx = int(clamp(target.screen_x, 0.0, 1.0) * (screen_w - 1))
+            ty = int(clamp(target.screen_y, 0.0, 1.0) * (screen_h - 1))
+            if calib_target is not None and target.name == calib_target.name:
+                color = (0, 255, 255)
+                radius = 34
+                thickness = 3
+            elif target.name in done_names:
+                color = (80, 180, 80)
+                radius = 14
+                thickness = 2
+            else:
+                color = (70, 70, 70)
+                radius = 12
+                thickness = 1
+            cv2.circle(canvas, (tx, ty), radius, color, thickness)
+            cv2.circle(canvas, (tx, ty), 4, color, -1)
+
+        if calib_target is not None:
+            tx = int(
+                clamp(calib_target.screen_x, 0.0, 1.0) * (screen_w - 1)
+            )
+            ty = int(
+                clamp(calib_target.screen_y, 0.0, 1.0) * (screen_h - 1)
+            )
+            cv2.line(canvas, (tx - 90, ty), (tx + 90, ty), (0, 200, 200), 1)
+            cv2.line(canvas, (tx, ty - 90), (tx, ty + 90), (0, 200, 200), 1)
+    else:
+        cv2.drawMarker(
+            canvas,
+            (cx, cy),
+            (55, 55, 55),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=48,
+            thickness=1,
+        )
+
+    if (
+        not calibrating
+        and screen_x is not None
+        and screen_y is not None
+    ):
+        mx = int(clamp(screen_x, 0.0, 1.0) * (screen_w - 1))
+        my = int(clamp(screen_y, 0.0, 1.0) * (screen_h - 1))
+        # I-DT 触发注视后变红，否则绿色
+        marker = (0, 0, 255) if marker_fixating else (0, 255, 0)
+        cross = (0, 0, 180) if marker_fixating else (0, 170, 0)
+        radius = 32 if marker_fixating else 26
+        cv2.line(canvas, (mx - 48, my), (mx + 48, my), cross, 1)
+        cv2.line(canvas, (mx, my - 48), (mx, my + 48), cross, 1)
+        cv2.circle(canvas, (mx, my), radius, marker, 3)
+        cv2.circle(canvas, (mx, my), 6, marker, -1)
+        label = (
+            f"FIXATION ({screen_x:.2f}, {screen_y:.2f})"
+            if marker_fixating
+            else f"({screen_x:.2f}, {screen_y:.2f})"
+        )
+        cv2.putText(
+            canvas,
+            label,
+            (mx + 34, my - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            marker,
+            2,
+            cv2.LINE_AA,
+        )
+
+    # 校准四角时隐藏摄像头小窗，避免挡住目标点
+    if (
+        not calibrating
+        and camera_frame is not None
+        and camera_frame.size > 0
+    ):
+        inset_w = max(260, screen_w // 5)
+        inset_h = int(
+            inset_w
+            * camera_frame.shape[0]
+            / max(camera_frame.shape[1], 1)
+        )
+        inset = cv2.resize(camera_frame, (inset_w, inset_h))
+        x0 = screen_w - inset_w - 28
+        y0 = screen_h - inset_h - 56
+        canvas[y0 : y0 + inset_h, x0 : x0 + inset_w] = inset
+        cv2.rectangle(
+            canvas,
+            (x0 - 1, y0 - 1),
+            (x0 + inset_w, y0 + inset_h),
+            (90, 90, 90),
+            1,
+        )
+        cv2.putText(
+            canvas,
+            "camera",
+            (x0, y0 - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (140, 140, 140),
+            1,
+            cv2.LINE_AA,
+        )
+
+    text_y = 48
+    for text, color in lines:
+        cv2.putText(
+            canvas,
+            text,
+            (36, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        text_y += 40
+
+    cv2.putText(
+        canvas,
+        "F: fullscreen   Esc: window   C: recalibrate   Q: quit",
+        (36, screen_h - 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (150, 150, 150),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return canvas
 
 
 def apply_deadzone(value: float, threshold: float) -> float:
@@ -130,6 +417,17 @@ def apply_deadzone(value: float, threshold: float) -> float:
     normalized = (abs(value) - threshold) / (1.0 - threshold)
 
     return sign * clamp(normalized, 0.0, 1.0)
+
+
+def apply_screen_deadzone(
+    screen_x: float,
+    screen_y: float,
+    threshold: float = SCREEN_DEADZONE,
+) -> tuple[float, float]:
+    """屏幕中心附近的小死区，不削弱边缘行程。"""
+    gx = apply_deadzone((screen_x - 0.5) * 2.0, threshold)
+    gy = apply_deadzone((screen_y - 0.5) * 2.0, threshold)
+    return 0.5 + gx * 0.5, 0.5 + gy * 0.5
 
 
 def point(
@@ -211,13 +509,20 @@ def vertical_eye_ratio(
     1：靠近下眼睑
     """
     eye_vector = lower_lid - upper_lid
+    eye_height = float(np.linalg.norm(eye_vector))
+
+    # 眼缝过窄时投影比例数值极不稳定
+    if eye_height < 2.0:
+        return 0.5
+
     denominator = float(np.dot(eye_vector, eye_vector)) + 1e-6
 
     ratio = float(
         np.dot(iris - upper_lid, eye_vector) / denominator
     )
 
-    return clamp(ratio, -0.5, 1.5)
+    # 收紧钳位，避免眨眼/landmark 抖动把比值打到极端
+    return clamp(ratio, 0.05, 0.95)
 
 
 def normalized_eye_openness(
@@ -371,12 +676,8 @@ def calculate_eye_ratios(
         right_lower,
     )
 
-    vertical_ratio = (
-        left_vertical + right_vertical
-    ) / 2.0
-
     # --------------------------------------------------------
-    # 睁眼程度
+    # 睁眼程度（先算，纵向按睁眼程度加权）
     # --------------------------------------------------------
 
     left_openness = normalized_eye_openness(
@@ -396,6 +697,16 @@ def calculate_eye_ratios(
     eye_openness = (
         left_openness + right_openness
     ) / 2.0
+
+    # 左右差异过大视为噪声帧，交给上层用上一帧
+    if abs(left_vertical - right_vertical) > 0.12:
+        vertical_ratio = float("nan")
+    else:
+        left_w = max(left_openness, 1e-3)
+        right_w = max(right_openness, 1e-3)
+        vertical_ratio = (
+            left_vertical * left_w + right_vertical * right_w
+        ) / (left_w + right_w)
 
     return (
         horizontal_ratio,
@@ -422,6 +733,11 @@ def update_shared_state(
     gaze_y: float,
     screen_x: float,
     screen_y: float,
+    *,
+    fixation: bool = False,
+    fixation_duration: float = 0.0,
+    fixation_x: float = 0.5,
+    fixation_y: float = 0.5,
 ) -> None:
     global state
 
@@ -435,6 +751,10 @@ def update_shared_state(
             screen_y=screen_y,
             raw_x=raw_x,
             raw_y=raw_y,
+            fixation=fixation,
+            fixation_duration=fixation_duration,
+            fixation_x=fixation_x,
+            fixation_y=fixation_y,
             timestamp=time.time(),
         )
 
@@ -471,28 +791,174 @@ def camera_loop() -> None:
 
     smooth_x = 0.5
     smooth_y = 0.5
+    last_raw_x = 0.5
+    last_raw_y = 0.5
+    last_features: np.ndarray | None = None
 
-    vertical_baseline: float | None = None
-    vertical_samples: list[float] = []
-
-    calibration_start_time = time.time()
+    gaze_mapper: RidgeGazeMapper | None = None
+    # 跟手优先，仍限速避免来回甩
+    kalman = KalmanGazeFilter(
+        process_var=4.0e-3,
+        measure_var=1.2e-3,
+        jump_threshold=0.12,
+        jump_blend=0.40,
+        max_velocity=2.8,
+    )
+    calib_index = 0
+    calib_phase_start = time.time()
+    calib_point_samples = 0
+    calib_results: list[tuple[np.ndarray, float, float]] = []
+    calib_done_names: set[str] = set()
+    last_frame_time = time.time()
+    idt = IdtFixationDetector()
 
     def begin_calibration() -> None:
-        nonlocal vertical_baseline
-        nonlocal vertical_samples
-        nonlocal calibration_start_time
+        nonlocal gaze_mapper
+        nonlocal calib_index
+        nonlocal calib_phase_start
+        nonlocal calib_point_samples
+        nonlocal calib_results
+        nonlocal calib_done_names
+        nonlocal smooth_x
         nonlocal smooth_y
+        nonlocal last_raw_x
+        nonlocal last_raw_y
+        nonlocal last_features
 
-        vertical_baseline = None
-        vertical_samples = []
-        calibration_start_time = time.time()
+        gaze_mapper = None
+        kalman.reset(0.5, 0.5)
+        reset_head_pose_smoother()
+        idt.reset()
+        calib_index = 0
+        calib_phase_start = time.time()
+        calib_point_samples = 0
+        calib_results = []
+        calib_done_names = set()
         smooth_x = 0.5
         smooth_y = 0.5
+        last_raw_x = 0.5
+        last_raw_y = 0.5
+        last_features = None
 
         print(
-            "[VPet-Gaze] Vertical calibration started. "
-            "Please look naturally at the center of the screen."
+            "[VPet-Gaze] 9-point Ridge calibration started. "
+            "Look at each yellow target until it turns green."
         )
+
+    screen_w, screen_h = get_primary_screen_size()
+    fullscreen = PREVIEW_START_FULLSCREEN
+
+    cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(PREVIEW_WINDOW_NAME, screen_w, screen_h)
+    set_preview_fullscreen(fullscreen)
+
+    print(
+        f"[VPet-Gaze] Preview {screen_w}x{screen_h}. "
+        f"I-DT debug {FIXATION_DURATION_SECONDS:.0f}s → red marker. "
+        "F=fullscreen, Esc=window, C=recalibrate, Q=quit"
+    )
+
+    def show_preview(
+        camera_frame: np.ndarray | None,
+        *,
+        screen_x: float | None,
+        screen_y: float | None,
+        lines: list[tuple[str, tuple[int, int, int]]],
+        calibrating: bool = False,
+        calib_target: CalibrationTarget | None = None,
+        marker_fixating: bool = False,
+    ) -> str:
+        """
+        显示全屏注视预览。
+        返回: 'quit' | 'continue'
+        """
+        nonlocal fullscreen
+
+        canvas = build_screen_preview(
+            screen_w,
+            screen_h,
+            camera_frame,
+            screen_x=screen_x,
+            screen_y=screen_y,
+            lines=lines,
+            calibrating=calibrating,
+            calib_target=calib_target,
+            calib_done_names=calib_done_names,
+            marker_fixating=marker_fixating,
+        )
+        cv2.imshow(PREVIEW_WINDOW_NAME, canvas)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            return "quit"
+
+        if key == 27:
+            if fullscreen:
+                fullscreen = False
+                set_preview_fullscreen(False)
+                return "continue"
+            return "quit"
+
+        if key == ord("f"):
+            fullscreen = not fullscreen
+            set_preview_fullscreen(fullscreen)
+            return "continue"
+
+        if key == ord("c"):
+            begin_calibration()
+
+        return "continue"
+
+    def hold_last_gaze(message: str, color: tuple[int, int, int]) -> bool:
+        """
+        眨眼/噪声帧时保持上一帧输出，避免 valid 断流造成桌宠跳变。
+        返回 True 表示应退出主循环。
+        """
+        if gaze_mapper is not None:
+            fixating, fix_dur, fix_cx, fix_cy = idt.update(
+                smooth_x,
+                smooth_y,
+                time.time(),
+            )
+            update_shared_state(
+                raw_x=last_raw_x,
+                raw_y=last_raw_y,
+                gaze_x=(smooth_x - 0.5) * 2.0,
+                gaze_y=(smooth_y - 0.5) * 2.0,
+                screen_x=smooth_x,
+                screen_y=smooth_y,
+                fixation=fixating,
+                fixation_duration=fix_dur,
+                fixation_x=fix_cx,
+                fixation_y=fix_cy,
+            )
+            marker_x: float | None = smooth_x
+            marker_y: float | None = smooth_y
+            idt_hint = (
+                f"I-DT FIXATION {fix_dur:.1f}s"
+                if fixating
+                else f"I-DT {fix_dur:.1f}s / {FIXATION_DURATION_SECONDS:.0f}s"
+            )
+            lines = [
+                (message, color),
+                (idt_hint, (0, 0, 255) if fixating else (180, 180, 180)),
+            ]
+            marker_fixating = fixating
+        else:
+            set_invalid_state(calibrating=True)
+            marker_x = None
+            marker_y = None
+            lines = [(message, color)]
+            marker_fixating = False
+
+        return show_preview(
+            frame,
+            screen_x=marker_x,
+            screen_y=marker_y,
+            lines=lines,
+            calibrating=gaze_mapper is None,
+            marker_fixating=marker_fixating,
+        ) == "quit"
 
     begin_calibration()
 
@@ -530,31 +996,25 @@ def camera_loop() -> None:
 
             if not result.multi_face_landmarks:
                 set_invalid_state(
-                    calibrating=vertical_baseline is None
+                    calibrating=gaze_mapper is None
                 )
 
-                cv2.putText(
+                active_target = (
+                    CALIBRATION_TARGETS[calib_index]
+                    if gaze_mapper is None
+                    and calib_index < len(CALIBRATION_TARGETS)
+                    else None
+                )
+
+                if show_preview(
                     frame,
-                    "No face detected",
-                    (18, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.72,
-                    (0, 0, 255),
-                    2,
-                )
-
-                cv2.imshow(
-                    "VPet Gaze Tracking - Q: quit, C: recalibrate",
-                    frame,
-                )
-
-                key = cv2.waitKey(1) & 0xFF
-
-                if key in (ord("q"), 27):
+                    screen_x=None,
+                    screen_y=None,
+                    lines=[("No face detected", (0, 0, 255))],
+                    calibrating=gaze_mapper is None,
+                    calib_target=active_target,
+                ) == "quit":
                     break
-
-                if key == ord("c"):
-                    begin_calibration()
 
                 continue
 
@@ -562,296 +1022,235 @@ def camera_loop() -> None:
                 result.multi_face_landmarks[0].landmark
             )
 
-            raw_x, raw_y, eye_openness = (
-                calculate_eye_ratios(
-                    landmarks,
-                    width,
-                    height,
-                )
+            extracted = extract_gaze_features(
+                landmarks,
+                width,
+                height,
             )
 
+            if extracted is None:
+                if hold_last_gaze("Feature invalid", (0, 165, 255)):
+                    break
+                continue
+
+            features, raw_x, raw_y, eye_openness = extracted
+
             # ------------------------------------------------
-            # 纵向校准
+            # 九点校准 + 全帧特征采样 → Ridge 映射
             # ------------------------------------------------
 
-            if vertical_baseline is None:
-                elapsed = (
-                    time.time() - calibration_start_time
-                )
-
-                # 只在眼睛正常睁开时收集校准数据
-                if (
-                    eye_openness
-                    > MIN_NORMALIZED_EYE_OPENNESS
-                ):
-                    vertical_samples.append(raw_y)
-
+            if gaze_mapper is None:
                 set_invalid_state(calibrating=True)
 
-                remaining = max(
-                    0.0,
-                    CALIBRATION_SECONDS - elapsed,
-                )
+                if calib_index >= len(CALIBRATION_TARGETS):
+                    if show_preview(
+                        frame,
+                        screen_x=None,
+                        screen_y=None,
+                        lines=[
+                            ("Calibration failed. Press C to retry.", (0, 0, 255)),
+                        ],
+                        calibrating=True,
+                    ) == "quit":
+                        break
+                    continue
 
-                cv2.putText(
-                    frame,
-                    "Look at screen center",
-                    (18, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.72,
-                    (0, 255, 255),
-                    2,
-                )
+                target = CALIBRATION_TARGETS[calib_index]
+                elapsed = time.time() - calib_phase_start
+                sample_ok = eye_openness > MIN_NORMALIZED_EYE_OPENNESS
 
-                cv2.putText(
-                    frame,
-                    f"Calibrating: {remaining:.1f}s",
-                    (18, 64),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 255, 255),
-                    2,
-                )
-
-                if elapsed >= CALIBRATION_SECONDS:
-                    if vertical_samples:
-                        vertical_baseline = float(
-                            np.median(vertical_samples)
+                if elapsed < CALIBRATION_SETTLE_SECONDS:
+                    phase_text = "Get ready..."
+                    remaining = CALIBRATION_SETTLE_SECONDS - elapsed
+                elif (
+                    elapsed
+                    < CALIBRATION_SETTLE_SECONDS
+                    + CALIBRATION_CAPTURE_SECONDS
+                ):
+                    phase_text = "Hold gaze"
+                    remaining = (
+                        CALIBRATION_SETTLE_SECONDS
+                        + CALIBRATION_CAPTURE_SECONDS
+                        - elapsed
+                    )
+                    if sample_ok:
+                        calib_results.append(
+                            (
+                                features.copy(),
+                                target.screen_x,
+                                target.screen_y,
+                            )
+                        )
+                        calib_point_samples += 1
+                else:
+                    if calib_point_samples >= CALIBRATION_MIN_SAMPLES:
+                        calib_done_names.add(target.name)
+                        print(
+                            f"[VPet-Gaze] Calibrated {target.name}: "
+                            f"n={calib_point_samples} -> "
+                            f"screen=({target.screen_x:.2f}, {target.screen_y:.2f})"
                         )
                     else:
-                        vertical_baseline = 0.5
+                        print(
+                            f"[VPet-Gaze] Not enough samples for "
+                            f"{target.name}, retrying this point..."
+                        )
+                        # 丢掉本点刚采的样本（注意 list[:-0] 会变成空列表）
+                        if calib_point_samples > 0:
+                            calib_results = calib_results[:-calib_point_samples]
+                        calib_phase_start = time.time()
+                        calib_point_samples = 0
+                        continue
 
-                    print(
-                        "[VPet-Gaze] Calibration complete. "
-                        f"Vertical baseline={vertical_baseline:.4f}"
-                    )
+                    calib_index += 1
+                    calib_phase_start = time.time()
+                    calib_point_samples = 0
 
-                cv2.imshow(
-                    "VPet Gaze Tracking - Q: quit, C: recalibrate",
+                    if calib_index >= len(CALIBRATION_TARGETS):
+                        gaze_mapper = fit_ridge_mapper(calib_results)
+                        if gaze_mapper is None:
+                            print(
+                                "[VPet-Gaze] Failed to fit Ridge mapper. "
+                                "Press C to recalibrate."
+                            )
+                            calib_index = len(CALIBRATION_TARGETS)
+                        else:
+                            kalman.reset(0.5, 0.5)
+                            smooth_x = 0.5
+                            smooth_y = 0.5
+                            print(
+                                "[VPet-Gaze] 9-point calibration complete "
+                                "(3D head+eye fusion + Ridge)."
+                            )
+
+                    continue
+
+                step = calib_index + 1
+                total = len(CALIBRATION_TARGETS)
+                if show_preview(
                     frame,
-                )
-
-                key = cv2.waitKey(1) & 0xFF
-
-                if key in (ord("q"), 27):
+                    screen_x=None,
+                    screen_y=None,
+                    lines=[
+                        (
+                            f"Look at yellow target: {target.name} "
+                            f"({step}/{total})",
+                            (0, 255, 255),
+                        ),
+                        (
+                            f"{phase_text}  {remaining:.1f}s  "
+                            f"samples={calib_point_samples}",
+                            (0, 255, 255),
+                        ),
+                    ],
+                    calibrating=True,
+                    calib_target=target,
+                ) == "quit":
                     break
-
-                if key == ord("c"):
-                    begin_calibration()
 
                 continue
 
             # ------------------------------------------------
-            # 眨眼或闭眼时，不更新视线
+            # 眨眼或闭眼：保持上一帧，不断流
             # ------------------------------------------------
 
-            if (
-                eye_openness
-                <= MIN_NORMALIZED_EYE_OPENNESS
-            ):
-                set_invalid_state()
-
-                cv2.putText(
-                    frame,
-                    "Blink detected",
-                    (18, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.72,
-                    (0, 165, 255),
-                    2,
-                )
-
-                cv2.imshow(
-                    "VPet Gaze Tracking - Q: quit, C: recalibrate",
-                    frame,
-                )
-
-                key = cv2.waitKey(1) & 0xFF
-
-                if key in (ord("q"), 27):
+            if eye_openness <= MIN_NORMALIZED_EYE_OPENNESS:
+                if hold_last_gaze("Blink hold", (0, 165, 255)):
                     break
-
-                if key == ord("c"):
-                    begin_calibration()
-
                 continue
 
-            # ------------------------------------------------
-            # 水平方向
-            # ------------------------------------------------
-
-            screen_x_raw = (
-                raw_x - HORIZONTAL_MIN
-            ) / (
-                HORIZONTAL_MAX - HORIZONTAL_MIN
-            )
-
-            screen_x_raw = clamp(
-                screen_x_raw,
-                SCREEN_X_MIN,
-                SCREEN_X_MAX,
-            )
-
-            gaze_x_raw = (
-                screen_x_raw - 0.5
-            ) * 2.0
-
-            gaze_x_raw = apply_deadzone(
-                gaze_x_raw,
-                HORIZONTAL_DEADZONE,
-            )
-
-            screen_x_target = clamp(
-                0.5 + gaze_x_raw * 0.47,
-                SCREEN_X_MIN,
-                SCREEN_X_MAX,
-            )
+            last_raw_x = float(raw_x)
+            last_raw_y = float(raw_y)
+            last_features = features
 
             # ------------------------------------------------
-            # 纵向方向
+            # 3D 几何 + Ridge → 屏幕坐标 → Kalman 平滑
+            # features: ... fused_yaw, fused_pitch, geo_sx, geo_sy
             # ------------------------------------------------
 
-            vertical_delta = raw_y - vertical_baseline
-
-            # tanh 非线性放大：
-            # 小幅眼球变化也能产生明显输出，同时避免直接硬截断造成跳变
-            gaze_y_raw = float(
-                np.tanh(vertical_delta * VERTICAL_GAIN)
+            ridge_x, ridge_y = gaze_mapper.map(features)
+            geo_sx = float(features[17])
+            geo_sy = float(features[18])
+            mapped_x = (1.0 - GEO_BLEND) * ridge_x + GEO_BLEND * geo_sx
+            mapped_y = (1.0 - GEO_BLEND) * ridge_y + GEO_BLEND * geo_sy
+            screen_x_target, screen_y_target = apply_screen_deadzone(
+                mapped_x,
+                mapped_y,
             )
 
-            gaze_y_raw = apply_deadzone(
-                gaze_y_raw,
-                0.015,
+            now = time.time()
+            dt = now - last_frame_time
+            last_frame_time = now
+            smooth_x, smooth_y = kalman.update(
+                screen_x_target,
+                screen_y_target,
+                dt=dt,
             )
 
-            screen_y_target = clamp(
-                0.5 + gaze_y_raw * 0.5,
-                0.0,
-                1.0,
-            )
+            final_gaze_x = (smooth_x - 0.5) * 2.0
+            final_gaze_y = (smooth_y - 0.5) * 2.0
 
-            # 如果上下方向反了，可以改成：
-            #
-            # screen_y_target = clamp(
-            #     0.5 - gaze_y_raw * 0.5,
-            #     0.0,
-            #     1.0,
-            # )
-
-            # ------------------------------------------------
-            # 平滑滤波
-            # ------------------------------------------------
-
-            smooth_x += (
-                SMOOTHING_X
-                * (screen_x_target - smooth_x)
-            )
-
-            smooth_y += (
-                SMOOTHING_Y
-                * (screen_y_target - smooth_y)
-            )
-
-            smooth_x = clamp(
+            # I-DT 调试：触发注视后预览点变红 + 控制台提示
+            fixating, fix_dur, fix_cx, fix_cy = idt.update(
                 smooth_x,
-                SCREEN_X_MIN,
-                SCREEN_X_MAX,
-            )
-
-            smooth_y = clamp(
                 smooth_y,
-                SCREEN_Y_MIN,
-                SCREEN_Y_MAX,
+                now,
             )
-
-            final_gaze_x = (
-                smooth_x - 0.5
-            ) * 2.0
-
-            final_gaze_y = (
-                smooth_y - 0.5
-            ) * 2.0
 
             update_shared_state(
-                raw_x=raw_x,
-                raw_y=raw_y,
+                raw_x=last_raw_x,
+                raw_y=last_raw_y,
                 gaze_x=final_gaze_x,
                 gaze_y=final_gaze_y,
                 screen_x=smooth_x,
                 screen_y=smooth_y,
+                fixation=fixating,
+                fixation_duration=fix_dur,
+                fixation_x=fix_cx,
+                fixation_y=fix_cy,
             )
+
+            head_yaw = float(features[10])
+            head_pitch = float(features[11])
+            fused_yaw = float(features[15])
+            fused_pitch = float(features[16])
 
             # ------------------------------------------------
-            # 预览信息
+            # 全屏预览：绿点=跟踪中；红点=I-DT 已触发注视
             # ------------------------------------------------
 
-            cv2.putText(
+            idt_color = (0, 0, 255) if fixating else (180, 180, 180)
+            idt_line = (
+                f"I-DT FIXATION  {fix_dur:.1f}s / {FIXATION_DURATION_SECONDS:.0f}s  "
+                f"center=({fix_cx:.2f},{fix_cy:.2f})"
+                if fixating
+                else (
+                    f"I-DT accumulating  {fix_dur:.1f}s / "
+                    f"{FIXATION_DURATION_SECONDS:.0f}s  "
+                    f"(dispersion<{IDT_DISPERSION_THRESHOLD})"
+                )
+            )
+
+            if show_preview(
                 frame,
-                (
-                    f"screen=({smooth_x:.2f}, "
-                    f"{smooth_y:.2f})"
-                ),
-                (18, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.70,
-                (255, 255, 255),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"raw_y={raw_y:.4f} base={vertical_baseline:.4f} "
-                    f"delta={raw_y - vertical_baseline:+.4f}"
-                ),
-                (18, 62),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (255, 255, 255),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"gaze_y={final_gaze_y:.2f} "
-                    f"eye={eye_openness:.3f}"
-                ),
-                (18, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (255, 255, 255),
-                2,
-            )
-
-            marker_x = int(
-                clamp(smooth_x, 0.0, 1.0) * (width - 1)
-            )
-
-            marker_y = int(
-                clamp(smooth_y, 0.0, 1.0) * (height - 1)
-            )
-
-            cv2.circle(
-                frame,
-                (marker_x, marker_y),
-                12,
-                (0, 255, 0),
-                2,
-            )
-
-            cv2.imshow(
-                "VPet Gaze Tracking - Q: quit, C: recalibrate",
-                frame,
-            )
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key in (ord("q"), 27):
+                screen_x=smooth_x,
+                screen_y=smooth_y,
+                marker_fixating=fixating,
+                lines=[
+                    (
+                        f"gaze screen=({smooth_x:.2f}, {smooth_y:.2f})",
+                        (255, 255, 255),
+                    ),
+                    (idt_line, idt_color),
+                    (
+                        f"3D head=({head_yaw:+.2f},{head_pitch:+.2f})  "
+                        f"fused=({fused_yaw:+.2f},{fused_pitch:+.2f})  "
+                        f"C=recalibrate",
+                        (200, 200, 200),
+                    ),
+                ],
+            ) == "quit":
                 break
-
-            if key == ord("c"):
-                begin_calibration()
 
     camera.release()
     cv2.destroyAllWindows()
@@ -883,6 +1282,10 @@ def get_gaze() -> dict[str, float | bool]:
             "screen_y": round(state.screen_y, 5),
             "raw_x": round(state.raw_x, 5),
             "raw_y": round(state.raw_y, 5),
+            "fixation": state.fixation,
+            "fixation_duration": round(state.fixation_duration, 3),
+            "fixation_x": round(state.fixation_x, 5),
+            "fixation_y": round(state.fixation_y, 5),
             "timestamp": state.timestamp,
         }
 
@@ -892,7 +1295,7 @@ def recalibrate() -> dict[str, str]:
     recalibration_requested.set()
 
     return {
-        "message": "Vertical gaze recalibration requested."
+        "message": "9-point Ridge gaze recalibration requested."
     }
 
 
