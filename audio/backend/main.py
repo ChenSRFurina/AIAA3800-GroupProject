@@ -20,6 +20,11 @@ load_dotenv(_VPET_ROOT / ".env", override=True)
 from learn_agent.agent.agent import Agent
 from learn_agent.llm import DeepSeek
 from learn_agent.memory import Memory
+from learn_agent.character_setting import (
+    LayeredMemoryManager,
+    PersonaAwareResponder,
+    PersonaConfig,
+)
 from learn_agent.tool.weather_tool import WeatherTool
 from learn_agent.tool.file_tool import FileTool
 from learn_agent.tool.todo_tool import TodoTool
@@ -35,11 +40,66 @@ except ImportError:
 # 全局 Agent 实例
 agent_instance: Agent | None = None
 
+# 长期记忆（持久化到 audio/backend/memory）
+memory_manager: LayeredMemoryManager | None = None
+persona_responder = PersonaAwareResponder()
+persona_config = PersonaConfig()
+DEFAULT_MEMORY_USER = "default"
+
 # 语音助手实例
 voice_assistant: "VoiceAssistant | None" = None
 
 # 语音消息队列 (供 Godot 轮询)
 voice_messages: deque[dict] = deque(maxlen=100)
+
+
+# 文件工具能力（必须始终内嵌在 system prompt 中，勿被人格段覆盖）
+FILE_TOOLS_PROMPT = (
+    "你有文件操作能力：可以读文件、写文件、编辑文件、执行简单命令。"
+    "所有文件操作在 work_dir 目录内进行。"
+    "当用户要求创建/读取/修改文件时，直接调用工具执行，不要说做不到。"
+)
+
+
+def _base_system_prompt() -> str:
+    return (
+        "你是用户的桌面宠物助手，说话简洁友好。\n"
+        f"{FILE_TOOLS_PROMPT}"
+    )
+
+
+def _refresh_system_prompt(user_text: str = "") -> None:
+    """把人设、文件工具能力、长期记忆合并进 Agent 的 system 消息。"""
+    if agent_instance is None or memory_manager is None:
+        return
+
+    memory_text = memory_manager.format_for_prompt(
+        DEFAULT_MEMORY_USER, topic=user_text, limit=5
+    )
+    full_prompt = persona_responder.build_system_prompt(
+        persona_config,
+        memory_text=memory_text,
+        tools_prompt=FILE_TOOLS_PROMPT,
+    )
+
+    agent_instance.system_prompt = full_prompt
+    ctx = agent_instance.memory.get_context()
+    if ctx and ctx[0].get("role") == "system":
+        ctx[0]["content"] = full_prompt
+    else:
+        agent_instance.memory.messages.insert(
+            0, {"role": "system", "content": full_prompt}
+        )
+
+
+def _after_user_turn(user_text: str) -> None:
+    """用户发言后：提取记忆并刷新 system prompt。"""
+    if memory_manager is None or not user_text.strip():
+        return
+    extracted = memory_manager.extract_from_text(DEFAULT_MEMORY_USER, user_text)
+    if extracted:
+        print(f"[Memory] 已持久化 {len(extracted)} 条: {extracted}")
+    _refresh_system_prompt(user_text)
 
 
 def _on_voice_response(text: str) -> None:
@@ -62,7 +122,7 @@ def _on_voice_transcript(text: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent_instance, voice_assistant
+    global agent_instance, voice_assistant, memory_manager
 
     api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip().strip("'\"")
     if not api_key:
@@ -73,15 +133,14 @@ async def lifespan(app: FastAPI):
             "获取: https://platform.deepseek.com/api_keys"
         )
 
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    memory_manager = LayeredMemoryManager(storage_dir=memory_dir)
+    print(f"[Memory] 长期记忆目录: {memory_dir}")
+
     agent_instance = Agent(
         session_id="web-session",
         name="web-assistant",
-        system_prompt=(
-            "你是用户的桌面宠物助手，说话简洁友好。"
-            "你有文件操作能力：可以读文件、写文件、编辑文件、执行简单命令。"
-            "所有文件操作在 work_dir 目录内进行。"
-            "当用户要求创建/读取/修改文件时，直接调用工具执行，不要说做不到。"
-        ),
+        system_prompt=_base_system_prompt(),
         llm=DeepSeek(api_key=api_key, model="deepseek-chat"),
         tools=[
             WeatherTool(),
@@ -90,6 +149,22 @@ async def lifespan(app: FastAPI):
         ],
         memory=Memory(),
     )
+    _refresh_system_prompt()
+
+    # 包装 run / run_stream：语音与 HTTP 统一走记忆提取 + prompt 注入
+    _orig_run = agent_instance.run
+    _orig_stream = agent_instance.run_stream
+
+    def _run_with_memory(user_text: str) -> str:
+        _after_user_turn(user_text)
+        return _orig_run(user_text)
+
+    def _stream_with_memory(user_text: str):
+        _after_user_turn(user_text)
+        yield from _orig_stream(user_text)
+
+    agent_instance.run = _run_with_memory  # type: ignore[method-assign]
+    agent_instance.run_stream = _stream_with_memory  # type: ignore[method-assign]
 
     # 启动语音助手 (可选)
     if _VOICE_AVAILABLE:

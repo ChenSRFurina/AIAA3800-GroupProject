@@ -391,3 +391,6 @@ VPet-Speaking/Local_model/F5-TTS/Fast_generating/outputs/
 VPet-Speaking/Local_model/F5-TTS/Fast_generating/temp/
 audio/models/
 audio/backend/work_dir/
+# 长期记忆 JSON（保留目录，不提交用户数据）
+audio/backend/memory/*
+!audio/backend/memory/.gitkeep
