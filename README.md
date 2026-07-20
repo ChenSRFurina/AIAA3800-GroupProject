@@ -210,6 +210,9 @@ cd audio\backend
 2. 重启桌宠
 3. 右键 → **自定 / DIY** 使用各功能
 
+**人脸情绪陪伴**：`start-all` 启动 Gaze + FaceDetect；FaceDetect **默认从 Gaze 共享摄像头帧**（`/camera/jpeg`），不必关视线、不必再抢摄像头。  
+会打开测试页便于看结果；VPet DIY「启动情绪陪伴」轮询 `/latest`。关闭共享：`FACE_USE_GAZE_CAMERA=0`。
+
 Debug 可加载未签名插件；Release 可能需开启「通过模组 / PassMOD」。
 
 ---

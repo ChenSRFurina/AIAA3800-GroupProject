@@ -563,55 +563,117 @@
         }
       }
 
+      async function openCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('当前浏览器不支持摄像头（请用 Chrome/Edge，并用 http://127.0.0.1 打开本页）');
+        }
+
+        const attempts = [
+          {
+            video: {
+              facingMode: 'user',
+              width: { ideal: 960 },
+              height: { ideal: 720 },
+            },
+            audio: false,
+          },
+          { video: true, audio: false },
+        ];
+
+        let lastError = null;
+        for (const constraints of attempts) {
+          try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        const name = lastError && lastError.name ? lastError.name : 'CameraError';
+        const msg = lastError && lastError.message ? lastError.message : String(lastError);
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          throw new Error('摄像头权限被拒绝：请点击地址栏摄像头图标允许，然后重试');
+        }
+        if (name === 'NotReadableError' || name === 'TrackStartError') {
+          throw new Error('摄像头被占用：请先关掉 Gaze 预览窗 / 其他占用摄像头的程序，再点开始测试');
+        }
+        if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          throw new Error('未找到摄像头设备');
+        }
+        throw new Error(`打开摄像头失败: ${name} ${msg}`);
+      }
+
       async function start() {
         if (mediaStream || websocket) {
           return;
         }
 
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 960 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        });
+        startButton.disabled = true;
+        setStatus('正在打开摄像头…', false);
+        updateJsonView({ status: 'starting', websocket_url: websocketUrl });
 
-        preview.srcObject = mediaStream;
-        await preview.play();
-        resizeOverlay();
+        try {
+          mediaStream = await openCamera();
+          preview.srcObject = mediaStream;
+          await preview.play();
+          resizeOverlay();
 
-        websocket = new WebSocket(websocketUrl);
-        websocket.binaryType = 'arraybuffer';
+          setStatus('正在连接推理服务…', false);
+          websocket = new WebSocket(websocketUrl);
+          websocket.binaryType = 'arraybuffer';
 
-        websocket.addEventListener('open', () => {
-          setStatus('已连接', true);
-          startButton.disabled = true;
-          stopButton.disabled = false;
-          startCaptureLoop();
-        });
+          websocket.addEventListener('open', () => {
+            setStatus('已连接（推流中）', true);
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            startCaptureLoop();
+            updateJsonView({
+              status: 'streaming',
+              websocket_url: websocketUrl,
+              note: '若右侧长期无结果，请看 FaceDetect 后端窗口是否在加载/报错模型。',
+            });
+          });
 
-        websocket.addEventListener('message', (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            handleInferencePayload(payload);
-          } catch (error) {
-            console.error('failed to parse backend payload', error);
-          }
-        });
+          websocket.addEventListener('message', (event) => {
+            try {
+              const payload = JSON.parse(event.data);
+              handleInferencePayload(payload);
+            } catch (error) {
+              console.error('failed to parse backend payload', error);
+            }
+          });
 
-        websocket.addEventListener('close', () => {
-          setStatus('连接关闭', false);
-          stopCaptureLoop();
-          websocket = null;
+          websocket.addEventListener('close', () => {
+            setStatus('连接关闭', false);
+            stopCaptureLoop();
+            websocket = null;
+            startButton.disabled = false;
+            stopButton.disabled = true;
+          });
+
+          websocket.addEventListener('error', (error) => {
+            console.error('websocket error', error);
+            setStatus('WebSocket 连接失败（后端 :8000 是否在跑？）', false);
+            updateJsonView({
+              status: 'websocket_error',
+              websocket_url: websocketUrl,
+              hint: '确认 FaceDetect LOCAL/RELAY 窗口无报错，且地址为 ws://127.0.0.1:8000/ws/infer',
+            });
+            startButton.disabled = false;
+          });
+        } catch (error) {
+          console.error('start failed', error);
+          const message = error && error.message ? error.message : String(error);
+          setStatus(message, false);
+          updateJsonView({
+            status: 'start_failed',
+            error: message,
+            websocket_url: websocketUrl,
+            tip: '侧栏里那段 websocket_url JSON 只是初始提示，不是开错页面。',
+          });
+          stop();
           startButton.disabled = false;
-          stopButton.disabled = true;
-        });
-
-        websocket.addEventListener('error', (error) => {
-          console.error('websocket error', error);
-          setStatus('连接异常', false);
-        });
+        }
       }
 
       function stop() {

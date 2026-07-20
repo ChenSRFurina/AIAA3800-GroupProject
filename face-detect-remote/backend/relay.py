@@ -85,6 +85,26 @@ async def health_check():
     }
 
 
+@app.get("/latest")
+async def latest_inference():
+    """转发远端最近一次情绪/疲劳摘要，供 VPet-FaceDetect 轮询。"""
+    if not REMOTE_BASE:
+        return JSONResponse(
+            status_code=503,
+            content={"valid": False, "message": "FACE_REMOTE_URL is not set"},
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(_remote_http_url("/latest"))
+            return response.json()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"valid": False, "message": f"remote /latest failed: {exc}"},
+        )
+
+
 async def _forward_client_to_remote(client_ws: WebSocket, remote_ws):
     while True:
         message = await client_ws.receive()

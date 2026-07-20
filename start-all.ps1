@@ -10,7 +10,8 @@ param(
     [string]$FaceRemoteUrl = "",
     [ValidateSet("cuda", "cpu")]
     [string]$Device = "cuda",
-    [switch]$Release
+    [switch]$Release,
+    [switch]$NoFaceBrowser
 )
 
 $ErrorActionPreference = "Stop"
@@ -195,6 +196,7 @@ if (-not $SkipGaze) {
     Write-Step "Skip Gaze"
 }
 
+$FaceDetectStarted = $false
 if (-not $SkipFaceDetect) {
     if ($Remote) {
         $remoteUrl = $FaceRemoteUrl
@@ -216,6 +218,7 @@ if (-not $SkipFaceDetect) {
             $faceCmd = ('set FACE_REMOTE_URL=' + $remoteUrl + '& ') + $launch.CommandLine
             Start-BackendWindow -Title "VPet-FaceDetect RELAY :8000" -WorkingDir $wd `
                 -CommandLine $faceCmd | Out-Null
+            $FaceDetectStarted = $true
         }
     } else {
         $wd = Join-Path $Root "face-detect-local\backend"
@@ -223,12 +226,42 @@ if (-not $SkipFaceDetect) {
             -ScriptArgs "server.py"
         Write-Ok ("FaceDetect local env: {0}" -f $launch.Source)
         # HF_ENDPOINT：multitask 权重未放本地时用镜像，避免 WinError 10054
-        $faceCmd = 'set HF_ENDPOINT=https://hf-mirror.com& ' + $launch.CommandLine
+        # 默认从 Gaze :8766/camera/jpeg 拉帧，可与视线同时开、不抢摄像头
+        $faceCmd = 'set HF_ENDPOINT=https://hf-mirror.com& set FACE_USE_GAZE_CAMERA=1& set FACE_GAZE_JPEG_URL=http://127.0.0.1:8766/camera/jpeg& ' + $launch.CommandLine
         Start-BackendWindow -Title "VPet-FaceDetect LOCAL :8000" -WorkingDir $wd `
             -CommandLine $faceCmd | Out-Null
+        $FaceDetectStarted = $true
     }
 } else {
     Write-Step "Skip FaceDetect"
+}
+
+# 浏览器推流页：等 :8000/health 就绪后自动打开（VPet 情绪陪伴靠此推流更新 /latest）
+$FaceTestUrl = "http://127.0.0.1:8000/test-frontend/"
+if ($FaceDetectStarted -and -not $NoFaceBrowser) {
+    Write-Step "Wait for FaceDetect :8000, then open browser test page..."
+    $ready = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -UseBasicParsing -TimeoutSec 2
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
+                $ready = $true
+                break
+            }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ($ready) {
+        Start-Process $FaceTestUrl
+        Write-Ok ("Opened FaceDetect page: {0}" -f $FaceTestUrl)
+        Write-Host "  Allow camera in the browser tab so VPet can poll /latest."
+    } else {
+        Write-Warn "FaceDetect health not ready yet; open manually:"
+        Write-Warn ("  {0}" -f $FaceTestUrl)
+    }
+} elseif ($FaceDetectStarted -and $NoFaceBrowser) {
+    Write-Step ("Skip FaceDetect browser (-NoFaceBrowser). Page: {0}" -f $FaceTestUrl)
 }
 
 if (-not $SkipAudio) {
@@ -270,4 +303,10 @@ if (-not $NoFrontend) {
 Write-Host ""
 Write-Ok "Launch requests sent. Close a backend window to stop that service."
 Write-Host "  DIY menu: Speak / Gaze / FaceDetect / Audio"
+if ($Remote) {
+    Write-Host "  FaceDetect: browser -> 127.0.0.1:8000 (relay) -> remote GPU"
+} else {
+    Write-Host "  FaceDetect LOCAL: pulls frames from Gaze /camera/jpeg (no need to close Gaze)"
+}
+Write-Host "  VPet DIY: 启动情绪陪伴 (polls /latest)"
 Write-Host ""

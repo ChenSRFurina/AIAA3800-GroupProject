@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -28,6 +29,12 @@ from learn_agent.character_setting import (
 from learn_agent.tool.weather_tool import WeatherTool
 from learn_agent.tool.file_tool import FileTool
 from learn_agent.tool.todo_tool import TodoTool
+from care_prompts import (
+    FALLBACK_LINES,
+    SCENE_USER_PROMPTS,
+    build_care_messages,
+    sanitize_care_reply,
+)
 import uvicorn
 
 # 语音模块 (可选)
@@ -93,12 +100,9 @@ def _refresh_system_prompt(user_text: str = "") -> None:
 
 
 def _after_user_turn(user_text: str) -> None:
-    """用户发言后：提取记忆并刷新 system prompt。"""
-    if memory_manager is None or not user_text.strip():
+    """普通对话回合：只刷新 system prompt，不落盘记忆。"""
+    if not (user_text or "").strip():
         return
-    extracted = memory_manager.extract_from_text(DEFAULT_MEMORY_USER, user_text)
-    if extracted:
-        print(f"[Memory] 已持久化 {len(extracted)} 条: {extracted}")
     _refresh_system_prompt(user_text)
 
 
@@ -112,12 +116,27 @@ def _on_voice_response(text: str) -> None:
 
 
 def _on_voice_transcript(text: str) -> None:
-    """语音转写回调 — 用户说的话。"""
+    """语音转写回调 — 仅此处写入长期记忆（用户原话）。"""
+    cleaned = (text or "").strip()
     voice_messages.append({
         "type": "user_message",
-        "content": text,
+        "content": cleaned,
         "source": "voice",
     })
+
+    if memory_manager is None or not cleaned:
+        return
+    entry = memory_manager.remember_voice_utterance(
+        DEFAULT_MEMORY_USER,
+        cleaned,
+        source_conversation_id="voice-asr",
+    )
+    if entry:
+        print(
+            f"[Memory] 语音用户话已记录: [{entry.category}/{entry.importance.name}] "
+            f"{entry.content}"
+        )
+        _refresh_system_prompt(cleaned)
 
 
 @asynccontextmanager
@@ -151,7 +170,7 @@ async def lifespan(app: FastAPI):
     )
     _refresh_system_prompt()
 
-    # 包装 run / run_stream：语音与 HTTP 统一走记忆提取 + prompt 注入
+    # 包装 run / run_stream：只注入已有记忆到 prompt；落盘仅语音转写回调
     _orig_run = agent_instance.run
     _orig_stream = agent_instance.run_stream
 
@@ -296,6 +315,102 @@ async def chat_reply(request: Request):
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "reply": ""}
+
+
+@app.post("/chat/care")
+async def chat_care(request: Request):
+    """
+    桌宠情绪陪伴（供 VPet-FaceDetect）：
+    不走工具 Agent、不写长期记忆；可注入已有语音记忆上下文。
+
+    请求体: {"scene":"happy|sad|surprise|fear|disgust|anger|fatigue", "hint":"..."}
+    响应: {"ok": true, "scene": "...", "reply": "..."}
+    """
+    body = await request.json()
+    scene = (body.get("scene") or "").strip().lower()
+    hint = (body.get("hint") or "").strip()
+
+    if scene not in SCENE_USER_PROMPTS:
+        return {
+            "ok": False,
+            "error": f"scene 需为 {sorted(SCENE_USER_PROMPTS)} 之一",
+            "reply": "",
+            "scene": scene,
+        }
+
+    def _fallback() -> str:
+        lines = FALLBACK_LINES.get(scene) or ["我在这儿陪着你。"]
+        return random.choice(lines)
+
+    memory_text = ""
+    if memory_manager is not None:
+        try:
+            memory_text = memory_manager.format_for_prompt(
+                DEFAULT_MEMORY_USER,
+                topic=hint or scene,
+                limit=5,
+            )
+        except Exception as mem_exc:
+            print(f"[Memory] care context skip: {mem_exc}")
+
+    if agent_instance is None or agent_instance.llm is None:
+        return {
+            "ok": True,
+            "scene": scene,
+            "reply": _fallback(),
+            "fallback": True,
+            "error": "Agent 未初始化，已用本地台词",
+            "memory_used": bool(memory_text and memory_text != "暂无历史信息"),
+        }
+
+    try:
+        messages = build_care_messages(
+            scene,
+            hint=hint,
+            memory_text=memory_text,
+        )
+
+        def _call() -> str:
+            llm = agent_instance.llm
+            old_max = getattr(llm, "max_tokens", None)
+            old_temp = getattr(llm, "temperature", None)
+            try:
+                llm.max_tokens = 64
+                llm.temperature = 0.6
+                msg = llm.chat(messages=messages, tools=None)
+            finally:
+                llm.max_tokens = old_max
+                llm.temperature = old_temp
+            return getattr(msg, "content", None) or ""
+
+        raw = await asyncio.to_thread(_call)
+        reply = sanitize_care_reply(raw)
+        mem_used = bool(memory_text and memory_text != "暂无历史信息")
+        if not reply:
+            reply = _fallback()
+            return {
+                "ok": True,
+                "scene": scene,
+                "reply": reply,
+                "fallback": True,
+                "raw_rejected": True,
+                "memory_used": mem_used,
+            }
+        return {
+            "ok": True,
+            "scene": scene,
+            "reply": reply,
+            "fallback": False,
+            "memory_used": mem_used,
+        }
+    except Exception as exc:
+        return {
+            "ok": True,
+            "scene": scene,
+            "reply": _fallback(),
+            "fallback": True,
+            "error": str(exc),
+        }
 
 
 # ── 语音相关接口 ────────────────────────────────────────────────────────

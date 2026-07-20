@@ -24,9 +24,15 @@ public static class GazeConfig
     public static double ArriveDistancePixels = 28.0;
 
     /// <summary>
-    /// 到达后：当前注视点与锁定目标的距离（归一化）小于该值，视为仍在发呆。
+    /// 到达后：当前注视点与锁定目标的距离（归一化）小于该值，视为仍在发呆（用于结束本次 visit）。
     /// </summary>
-    public static double DaydreamGazeDistance = 0.12;
+    public static double DaydreamGazeDistance = 0.18;
+
+    /// <summary>
+    /// true：走到注视点后必定说一次发呆台词（推荐）。
+    /// false：仅当到达时视线仍靠近目标才说（走动期间视线一飘就容易不说话）。
+    /// </summary>
+    public static bool SpeakDaydreamOnArrive = true;
 
     /// <summary>同一次发呆只触发一次说话；离开注视点后可再次触发。</summary>
     public static double DaydreamCooldownSeconds = 8.0;

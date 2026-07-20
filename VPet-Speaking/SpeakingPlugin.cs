@@ -82,18 +82,42 @@ namespace VPet.Plugin.Speaking
 
         /// <summary>
         /// 供其他插件（如 VPet-Gaze 发呆提醒）调用：气泡 + F5/讯飞 TTS。
+        /// 可从任意线程调用；UI 部分会切回主线程。
         /// </summary>
         public void SpeakExternal(string text, bool showErrorDialog = false, string tag = "external")
         {
             if (string.IsNullOrWhiteSpace(text))
                 return;
-            if (_busyDebugSpeak || _busyLlmSpeak)
+
+            // Gaze / FaceDetect 轮询在后台线程，必须切回 UI 再碰 WPF
+            if (!MW.Main.Dispatcher.CheckAccess())
+            {
+                MW.Main.Dispatcher.Invoke(() => SpeakExternal(text, showErrorDialog, tag));
                 return;
+            }
+
+            if (_busyDebugSpeak || _busyLlmSpeak)
+            {
+                Console.WriteLine(
+                    $"[VPet-Speaking] SpeakExternal skipped (busy debug={_busyDebugSpeak} llm={_busyLlmSpeak}) tag={tag}");
+                return;
+            }
 
             _f5 ??= F5TtsClient.FromConfigNearAssembly();
             _busyDebugSpeak = true;
-            MW.Main.ToolBar.Visibility = Visibility.Collapsed;
-            MW.Main.SayRnd(text, force: true);
+            try
+            {
+                MW.Main.ToolBar.Visibility = Visibility.Collapsed;
+                MW.Main.SayRnd(text, force: true);
+            }
+            catch (Exception ex)
+            {
+                _busyDebugSpeak = false;
+                Console.WriteLine($"[VPet-Speaking] SpeakExternal UI failed: {ex.Message}");
+                return;
+            }
+
+            Console.WriteLine($"[VPet-Speaking] SpeakExternal start tag={tag}: {text}");
 
             Task.Run(async () =>
             {

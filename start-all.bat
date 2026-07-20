@@ -12,6 +12,7 @@ echo   将打开多个窗口:
 echo     [1] Speaking   F5-TTS     :8765
 echo     [2] Gaze       视线跟随   :8766
 echo     [3] FaceDetect 人脸检测   :8000  (默认本地推理)
+echo         + 自动打开浏览器测试页推流
 echo     [4] Audio      语音助手   :8010
 echo     [5] VPet       桌宠前端
 echo.
@@ -26,6 +27,7 @@ echo     start-all.bat -Remote -FaceRemoteUrl http://192.168.1.10:8000
 echo     start-all.bat -GazeMock
 echo     start-all.bat -SkipAudio -Device cpu
 echo     start-all.bat -NoFrontend
+echo     start-all.bat -NoFaceBrowser
 echo     start-all.bat -Release
 echo.
 echo   停止全部: 双击 stop-all.bat

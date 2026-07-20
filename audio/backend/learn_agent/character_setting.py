@@ -432,6 +432,59 @@ class LayeredMemoryManager:
             [{"role": "user", "content": user_text}],
         )
 
+    @staticmethod
+    def normalize_voice_transcript(transcript: str) -> str:
+        """清洗语音识别文本：去首尾空白、压缩空白、去掉常见 ASR 噪声标记。"""
+        if not transcript or not isinstance(transcript, str):
+            return ""
+        text = transcript.strip()
+        text = re.sub(r"\s+", " ", text)
+        # 去掉方括号/尖括号时间戳或噪声标签
+        text = re.sub(r"[\[\<][^\]\>]*[\]\>]", "", text)
+        text = text.strip(" \t\"'“”‘’。．.…")
+        return text.strip()
+
+    def _classify_utterance(
+        self, text: str
+    ) -> tuple[str, MemoryImportance]:
+        for category, importance, keywords in self._EXTRACT_RULES:
+            if any(kw in text for kw in keywords):
+                return category, importance
+        return "other", MemoryImportance.MEDIUM
+
+    def remember_voice_utterance(
+        self,
+        user_id: str,
+        transcript: str,
+        *,
+        source_conversation_id: str = "voice-asr",
+    ) -> Optional[MemoryEntry]:
+        """
+        仅记录语音识别得到的用户原话（已格式化）。
+        不记录助手回复、情绪陪伴台词、HTTP 调试输入。
+        """
+        text = self.normalize_voice_transcript(transcript)
+        if not text:
+            return None
+
+        # 过滤过短语气词
+        fillers = {"嗯", "啊", "哦", "呃", "唔", "嗯嗯", "啊啊", "哦哦", "哈", "呵"}
+        if text in fillers:
+            return None
+        if len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text)) < 2:
+            return None
+
+        category, importance = self._classify_utterance(text)
+        # 统一格式，便于 prompt / JSON 阅读
+        content = f"用户说：{text}"
+        return self.store(
+            user_id,
+            content,
+            importance,
+            category,
+            source_conversation_id=source_conversation_id,
+        )
+
     # ── profile / prompt helpers ────────────────────────────────────────
 
     def update_profile(self, user_id: str, **fields: Any) -> None:
@@ -466,8 +519,11 @@ class PersonaConfig:
     """AI 人设配置"""
 
     name: str = "小暖"
-    personality: str = "温柔、善解人意、偶尔幽默"
-    speaking_style: str = "使用温暖的语气，偶尔用生活化的比喻，避免说教"
+    personality: str = "温柔、善解人意、偶尔幽默，像桌角小宠物"
+    speaking_style: str = (
+        "只用第一人称当面说话；一次尽量 1～3 句、偏短口语；"
+        "禁止第三人称旁白、禁止描写自己的表情/动作/眼神/声音比喻、禁止小说体"
+    )
     boundaries: str = "不提供医疗诊断，不替代专业心理咨询，遇到危机情况建议拨打热线"
 
 
@@ -493,12 +549,15 @@ class PersonaAwareResponder:
             tools_block = f"\n【工具能力】\n{tools_prompt.strip()}\n"
 
         return (
-            f"你是{persona.name}，用户的桌面宠物助手，性格{persona.personality}。\n"
+            f"你是{persona.name}，用户电脑上的陪伴桌宠，性格{persona.personality}。\n"
             f"说话风格：{persona.speaking_style}\n"
             f"边界：{persona.boundaries}\n"
             f"{tools_block}\n"
             f"你了解以下关于用户的信息：\n{memory_text or '暂无历史信息'}\n\n"
-            f"请基于以上信息，以{persona.name}的身份自然地回复用户。"
+            f"【输出硬规则】\n"
+            f"- 直接输出要对用户说的话，不要写「{persona.name}笑了」「她轻轻…」这类旁白。\n"
+            f"- 不要用引号包住整段回复，不要舞台指示。\n"
+            f"- 日常闲聊保持短句；需要工具时先调用工具，最终对用户的说明也要简短。\n"
             f"如果用户提到了你已知的信息，自然地表现出你记得，但不要刻意罗列。"
             f"需要读写文件或执行命令时，优先调用工具，不要声称做不到。"
         )

@@ -172,14 +172,15 @@ public sealed class GazeTrackingClient : IDisposable
                     StopWalkAnimation();
                     Console.WriteLine("[VPet-Gaze] arrived at fixation target.");
 
-                    TrySpeakDaydreamIfStillStaring(sx, sy, nowUnix);
+                    // 默认到达即说话：走动几秒后视线常已飘走，旧逻辑「仍盯着」会导致永远不 TTS
+                    TrySpeakDaydream(sx, sy, nowUnix, requireStillStaring: !GazeConfig.SpeakDaydreamOnArrive);
                 }
                 break;
 
             case Phase.ArrivedHold:
-                // 到达后短暂停留；若仍盯着则说话；离开注视点后重新等待下一次 I-DT
+                // 若到达瞬间 Speaking 正忙，这里再补一次
                 if (!_daydreamSpokenForThisVisit)
-                    TrySpeakDaydreamIfStillStaring(sx, sy, nowUnix);
+                    TrySpeakDaydream(sx, sy, nowUnix, requireStillStaring: !GazeConfig.SpeakDaydreamOnArrive);
 
                 var stillNear = _idt.IsStillNear(
                     _targetScreenX,
@@ -197,26 +198,36 @@ public sealed class GazeTrackingClient : IDisposable
         }
     }
 
-    private void TrySpeakDaydreamIfStillStaring(double sx, double sy, double nowUnix)
+    private void TrySpeakDaydream(double sx, double sy, double nowUnix, bool requireStillStaring)
     {
         if (_daydreamSpokenForThisVisit)
             return;
 
         if (nowUnix - _lastDaydreamSpeakUnix < GazeConfig.DaydreamCooldownSeconds)
+        {
+            Console.WriteLine("[VPet-Gaze] daydream skipped: cooldown");
             return;
+        }
 
-        var dist = Math.Sqrt(
-            (sx - _targetScreenX) * (sx - _targetScreenX)
-            + (sy - _targetScreenY) * (sy - _targetScreenY));
-        var still = dist <= GazeConfig.DaydreamGazeDistance
-                    || _idt.IsStillNear(
-                        _targetScreenX,
-                        _targetScreenY,
-                        _frameClock.Elapsed.TotalSeconds,
-                        GazeConfig.DaydreamGazeDistance);
+        if (requireStillStaring)
+        {
+            var dist = Math.Sqrt(
+                (sx - _targetScreenX) * (sx - _targetScreenX)
+                + (sy - _targetScreenY) * (sy - _targetScreenY));
+            var still = dist <= GazeConfig.DaydreamGazeDistance
+                        || _idt.IsStillNear(
+                            _targetScreenX,
+                            _targetScreenY,
+                            _frameClock.Elapsed.TotalSeconds,
+                            GazeConfig.DaydreamGazeDistance);
 
-        if (!still)
-            return;
+            if (!still)
+            {
+                Console.WriteLine(
+                    $"[VPet-Gaze] daydream skipped: gaze left target dist={dist:0.00}");
+                return;
+            }
+        }
 
         var lines = GazeConfig.DaydreamLines;
         if (lines.Length == 0)
@@ -231,13 +242,22 @@ public sealed class GazeTrackingClient : IDisposable
 
     private void SpeakViaSpeakingPlugin(string text)
     {
-        // 优先走 VPet-Speaking 的公开入口（气泡 + F5/讯飞 TTS）
         foreach (var plugin in _mainWindow.Plugins)
         {
             if (plugin.GetType().FullName != "VPet.Plugin.Speaking.SpeakingPlugin")
                 continue;
 
-            var method = plugin.GetType().GetMethod("SpeakExternal");
+            var method = plugin.GetType().GetMethod(
+                "SpeakExternal",
+                [typeof(string), typeof(bool), typeof(string)]);
+            if (method != null)
+            {
+                method.Invoke(plugin, [text, false, "gaze-daydream"]);
+                return;
+            }
+
+            // 兼容旧签名 SpeakExternal(string)
+            method = plugin.GetType().GetMethod("SpeakExternal", [typeof(string)]);
             if (method != null)
             {
                 method.Invoke(plugin, [text]);
@@ -245,7 +265,7 @@ public sealed class GazeTrackingClient : IDisposable
             }
         }
 
-        // Speaking 未加载时至少弹出气泡
+        Console.WriteLine("[VPet-Gaze] SpeakingPlugin not found; bubble only.");
         _mainWindow.Main.Dispatcher.Invoke(() =>
             _mainWindow.Main.SayRnd(text, force: true));
     }

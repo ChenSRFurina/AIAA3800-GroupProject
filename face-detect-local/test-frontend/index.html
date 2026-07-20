@@ -294,7 +294,7 @@
           <div class="meta">
             <div><strong>WebSocket</strong><div id="socketUrl"></div></div>
             <div><strong>最近帧</strong><div id="frameInfo">尚未收到推理结果</div></div>
-            <div><strong>提示</strong><div class="hint">控制台会输出情绪概率和疲劳派生指标。建议先启动后端，再打开这个页面。</div></div>
+            <div><strong>提示</strong><div class="hint">默认优先复用 Gaze 摄像头（不必关视线）。后端也会自动从 Gaze 拉帧更新 /latest。强制本机摄像头：URL 加 ?localcam=1</div></div>
           </div>
           <div class="emotion-panel">
             <div class="section-title"><span>Emotion Probabilities</span><span>Per face</span></div>
@@ -326,8 +326,11 @@
       const captureCanvas = document.createElement('canvas');
       const captureContext = captureCanvas.getContext('2d', { willReadFrequently: false });
       const websocketUrl = new URLSearchParams(window.location.search).get('ws') || `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/infer`;
+      const GAZE_JPEG_URL = new URLSearchParams(window.location.search).get('gaze') || 'http://127.0.0.1:8766/camera/jpeg';
+      const GAZE_STATUS_URL = GAZE_JPEG_URL.replace(/\/camera\/jpeg\/?$/, '/camera/status');
       const CAPTURE_INTERVAL_MS = 80;
       const CAPTURE_MAX_WIDTH = 640;
+      const FORCE_LOCAL_CAMERA = new URLSearchParams(window.location.search).get('localcam') === '1';
 
       let mediaStream = null;
       let websocket = null;
@@ -546,16 +549,6 @@
         websocket.send(arrayBuffer);
       }
 
-      function startCaptureLoop() {
-        if (captureTimerId !== null) {
-          window.clearInterval(captureTimerId);
-        }
-
-        captureTimerId = window.setInterval(() => {
-          void sendCurrentFrame();
-        }, CAPTURE_INTERVAL_MS);
-      }
-
       function stopCaptureLoop() {
         if (captureTimerId !== null) {
           window.clearInterval(captureTimerId);
@@ -563,32 +556,114 @@
         }
       }
 
-      async function start() {
-        if (mediaStream || websocket) {
+      let useGazeShare = false;
+
+      async function openCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('当前浏览器不支持摄像头（请用 Chrome/Edge，并用 http://127.0.0.1 打开本页）');
+        }
+
+        const attempts = [
+          {
+            video: {
+              facingMode: 'user',
+              width: { ideal: 960 },
+              height: { ideal: 720 },
+            },
+            audio: false,
+          },
+          { video: true, audio: false },
+        ];
+
+        let lastError = null;
+        for (const constraints of attempts) {
+          try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        const name = lastError && lastError.name ? lastError.name : 'CameraError';
+        const msg = lastError && lastError.message ? lastError.message : String(lastError);
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          throw new Error('摄像头权限被拒绝：请点击地址栏摄像头图标允许，然后重试');
+        }
+        if (name === 'NotReadableError' || name === 'TrackStartError') {
+          throw new Error('摄像头被占用：请用 Gaze 共享模式（默认），或关掉占用摄像头的程序');
+        }
+        if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          throw new Error('未找到摄像头设备');
+        }
+        throw new Error(`打开摄像头失败: ${name} ${msg}`);
+      }
+
+      async function probeGazeShare() {
+        const resp = await fetch(GAZE_STATUS_URL, { cache: 'no-store' });
+        if (!resp.ok) {
+          throw new Error(`Gaze 状态接口 HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (!data.has_frame) {
+          throw new Error('Gaze 尚无画面，请先让视线服务出图（校准/预览窗）');
+        }
+        return data;
+      }
+
+      async function sendGazeSharedFrame() {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
           return;
         }
 
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 960 },
-            height: { ideal: 720 },
-          },
-          audio: false,
+        const resp = await fetch(`${GAZE_JPEG_URL}?t=${Date.now()}`, { cache: 'no-store' });
+        if (!resp.ok) {
+          return;
+        }
+
+        const blob = await resp.blob();
+        const bitmap = await createImageBitmap(blob);
+        captureCanvas.width = bitmap.width;
+        captureCanvas.height = bitmap.height;
+        lastCaptureWidth = bitmap.width;
+        lastCaptureHeight = bitmap.height;
+        captureContext.drawImage(bitmap, 0, 0);
+        bitmap.close();
+
+        if (!preview.srcObject) {
+          preview.srcObject = captureCanvas.captureStream(6);
+          await preview.play().catch(() => {});
+          resizeOverlay();
+        }
+
+        const outBlob = await new Promise((resolve) => {
+          captureCanvas.toBlob(resolve, 'image/jpeg', 0.82);
         });
+        if (!outBlob) {
+          return;
+        }
+        websocket.send(await outBlob.arrayBuffer());
+      }
 
-        preview.srcObject = mediaStream;
-        await preview.play();
-        resizeOverlay();
-
-        websocket = new WebSocket(websocketUrl);
+      function bindWebsocketHandlers() {
         websocket.binaryType = 'arraybuffer';
 
         websocket.addEventListener('open', () => {
-          setStatus('已连接', true);
+          const mode = useGazeShare ? 'Gaze共享画面' : '本机摄像头';
+          setStatus(`已连接（${mode}推流中）`, true);
           startButton.disabled = true;
           stopButton.disabled = false;
-          startCaptureLoop();
+          if (useGazeShare) {
+            startCaptureLoop();
+          } else {
+            startCaptureLoop();
+          }
+          updateJsonView({
+            status: 'streaming',
+            mode: useGazeShare ? 'gaze_share' : 'local_camera',
+            websocket_url: websocketUrl,
+            gaze_jpeg_url: useGazeShare ? GAZE_JPEG_URL : null,
+            note: '后端也可自行从 Gaze 拉帧更新 /latest；不必关 Gaze。',
+          });
         });
 
         websocket.addEventListener('message', (event) => {
@@ -610,8 +685,75 @@
 
         websocket.addEventListener('error', (error) => {
           console.error('websocket error', error);
-          setStatus('连接异常', false);
+          setStatus('WebSocket 连接失败（后端 :8000 是否在跑？）', false);
+          updateJsonView({
+            status: 'websocket_error',
+            websocket_url: websocketUrl,
+          });
+          startButton.disabled = false;
         });
+      }
+
+      function startCaptureLoop() {
+        if (captureTimerId !== null) {
+          window.clearInterval(captureTimerId);
+        }
+
+        const interval = useGazeShare ? 200 : CAPTURE_INTERVAL_MS;
+        captureTimerId = window.setInterval(() => {
+          if (useGazeShare) {
+            void sendGazeSharedFrame();
+          } else {
+            void sendCurrentFrame();
+          }
+        }, interval);
+      }
+
+      async function start() {
+        if (mediaStream || websocket) {
+          return;
+        }
+
+        startButton.disabled = true;
+        useGazeShare = false;
+        updateJsonView({ status: 'starting', websocket_url: websocketUrl });
+
+        try {
+          if (!FORCE_LOCAL_CAMERA) {
+            try {
+              setStatus('尝试 Gaze 共享摄像头（可不关视线）…', false);
+              await probeGazeShare();
+              useGazeShare = true;
+            } catch (gazeError) {
+              console.warn('gaze share unavailable, fallback local camera', gazeError);
+              setStatus('Gaze 共享不可用，改用本机摄像头…', false);
+            }
+          }
+
+          if (!useGazeShare) {
+            setStatus('正在打开本机摄像头…', false);
+            mediaStream = await openCamera();
+            preview.srcObject = mediaStream;
+            await preview.play();
+            resizeOverlay();
+          }
+
+          setStatus('正在连接推理服务…', false);
+          websocket = new WebSocket(websocketUrl);
+          bindWebsocketHandlers();
+        } catch (error) {
+          console.error('start failed', error);
+          const message = error && error.message ? error.message : String(error);
+          setStatus(message, false);
+          updateJsonView({
+            status: 'start_failed',
+            error: message,
+            websocket_url: websocketUrl,
+            tip: '默认会优先用 Gaze /camera/jpeg，无需关掉视线。强制本机摄像头可加 ?localcam=1',
+          });
+          stop();
+          startButton.disabled = false;
+        }
       }
 
       function stop() {

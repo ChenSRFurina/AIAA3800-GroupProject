@@ -14,6 +14,7 @@
     <ProjectReference Include="..\VPet-Simulator.Windows.Interface\VPet-Simulator.Windows.Interface.csproj" />
   </ItemGroup>
 
+  <!-- VPet 会 Assembly.LoadFrom 扫描 plugin 下每个 *.dll；禁止放入原生/第三方 DLL -->
   <Target Name="DeployToMod" AfterTargets="Build">
     <PropertyGroup>
       <ModDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\mod\1400_VPet-FaceDetect</ModDir>
@@ -21,12 +22,16 @@
       <BinModDir>$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod\1400_VPet-FaceDetect</BinModDir>
       <BinModPluginDir>$(BinModDir)\plugin</BinModPluginDir>
     </PropertyGroup>
+
+    <!-- 不要 RemoveDir：VPet 运行中会锁 DLL 导致部署失败 -->
     <MakeDir Directories="$(ModPluginDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="false" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModPluginDir)" SkipUnchangedFiles="false" Condition="Exists('$(TargetDir)$(TargetName).pdb')" ContinueOnError="true" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\1400_VPet-FaceDetect\info.lps" DestinationFolder="$(ModDir)" SkipUnchangedFiles="true" />
-    <MakeDir Directories="$(BinModPluginDir)" Condition="Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows') And !Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\mod')" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BinModPluginDir)" SkipUnchangedFiles="true" Condition="Exists('$(BinModPluginDir)')" />
+
+    <MakeDir Directories="$(BinModPluginDir)" Condition="Exists('$(MSBuildProjectDirectory)\..\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows')" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BinModPluginDir)" SkipUnchangedFiles="false" Condition="Exists('$(BinModPluginDir)')" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(BinModPluginDir)" SkipUnchangedFiles="false" Condition="Exists('$(BinModPluginDir)') And Exists('$(TargetDir)$(TargetName).pdb')" ContinueOnError="true" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\1400_VPet-FaceDetect\info.lps" DestinationFolder="$(BinModDir)" SkipUnchangedFiles="true" Condition="Exists('$(BinModDir)')" />
   </Target>
 </Project>

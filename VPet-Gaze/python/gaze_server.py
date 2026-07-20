@@ -9,6 +9,8 @@ import mediapipe as mp
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from gaze_model import (
     KalmanGazeFilter,
@@ -25,6 +27,12 @@ from gaze_model import (
 # ============================================================
 
 app = FastAPI(title="VPet Gaze Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
@@ -134,6 +142,31 @@ class SharedState:
 
 state = SharedState()
 state_lock = threading.Lock()
+
+# 最新摄像头 JPEG（供 FaceDetect / 浏览器共享，避免再开一次摄像头）
+_latest_jpeg_lock = threading.Lock()
+_latest_jpeg: bytes | None = None
+_latest_jpeg_ts: float = 0.0
+_latest_jpeg_size: tuple[int, int] = (0, 0)
+
+
+def publish_camera_jpeg(frame_bgr: np.ndarray) -> None:
+    """把当前帧编码为 JPEG，供 /camera/jpeg 读取。"""
+    global _latest_jpeg, _latest_jpeg_ts, _latest_jpeg_size
+
+    ok, buf = cv2.imencode(
+        ".jpg",
+        frame_bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 75],
+    )
+    if not ok:
+        return
+
+    h, w = frame_bgr.shape[:2]
+    with _latest_jpeg_lock:
+        _latest_jpeg = buf.tobytes()
+        _latest_jpeg_ts = time.time()
+        _latest_jpeg_size = (int(w), int(h))
 
 
 # 重新校准标志
@@ -984,6 +1017,7 @@ def camera_loop() -> None:
 
             # 镜像画面，使预览方向符合用户直觉
             frame = cv2.flip(frame, 1)
+            publish_camera_jpeg(frame)
 
             height, width = frame.shape[:2]
 
@@ -1265,8 +1299,53 @@ def root() -> dict[str, str]:
     return {
         "message": (
             "VPet gaze service is running. "
-            "Open /gaze for tracking data."
+            "Open /gaze for tracking data; "
+            "/camera/jpeg shares the live frame with FaceDetect."
         )
+    }
+
+
+@app.get("/camera/jpeg")
+def get_camera_jpeg():
+    """共享当前摄像头帧（JPEG），供 FaceDetect 浏览器/后端复用。"""
+    with _latest_jpeg_lock:
+        data = _latest_jpeg
+        ts = _latest_jpeg_ts
+        size = _latest_jpeg_size
+
+    if not data:
+        return Response(
+            content=b"no camera frame yet",
+            status_code=503,
+            media_type="text/plain",
+        )
+
+    age = max(0.0, time.time() - ts)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Age": f"{age:.3f}",
+            "X-Frame-Width": str(size[0]),
+            "X-Frame-Height": str(size[1]),
+        },
+    )
+
+
+@app.get("/camera/status")
+def get_camera_status() -> dict[str, float | bool | int]:
+    with _latest_jpeg_lock:
+        ts = _latest_jpeg_ts
+        size = _latest_jpeg_size
+        has = _latest_jpeg is not None
+    age = (time.time() - ts) if has and ts > 0 else -1.0
+    return {
+        "ok": has and 0 <= age < 2.0,
+        "has_frame": has,
+        "age_sec": round(age, 3),
+        "width": size[0],
+        "height": size[1],
     }
 
 
