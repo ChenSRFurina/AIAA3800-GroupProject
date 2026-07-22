@@ -114,7 +114,7 @@ namespace VPet.Plugin.Speaking
             }
 
             throw new InvalidOperationException(
-                $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/F5-TTS/Fast_generating/start_server.py");
+                $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/Fast_generating/start_server.py");
         }
 
         public static F5TtsClient FromConfigNearAssembly()
@@ -158,7 +158,7 @@ namespace VPet.Plugin.Speaking
             {
                 client.Dispose();
                 throw new InvalidOperationException(
-                    $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/F5-TTS/Fast_generating/start_server.py",
+                    $"无法连接本地 F5-TTS 服务 {_host}:{_port}。请先运行: python Local_model/Fast_generating/start_server.py",
                     ex);
             }
 

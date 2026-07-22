@@ -20,8 +20,9 @@ Set-Location $Root
 
 # Fixed conda env names (override python via VPET_*_PYTHON if needed)
 $CondaEnvF5 = "F5TTS"
+$CondaEnvGaze = "GAZE"
 $CondaEnvFace = "FACE"
-$AudioVenvPython = Join-Path $Root "audio\backend\.venv\Scripts\python.exe"
+$CondaEnvAudio = "AUDIO"
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -170,11 +171,11 @@ if ($Remote) {
     Write-Host "  Face : LOCAL face-detect-local on :8000"
 }
 Write-Host "  Ports: Speaking 8765 | Gaze 8766 | Face 8000 | Audio 8010"
-Write-Host "  Envs : Speaking/Gaze -> conda F5TTS | Face -> conda FACE | Audio -> audio\backend\.venv"
+Write-Host "  Envs : Speaking -> conda F5TTS | Gaze -> conda GAZE | Face -> conda FACE | Audio -> conda AUDIO"
 Write-Host ""
 
 if (-not $SkipSpeaking) {
-    $wd = Join-Path $Root "VPet-Speaking\Local_model\F5-TTS\Fast_generating"
+    $wd = Join-Path $Root "VPet-Speaking\Local_model\Fast_generating"
     $launch = Build-CondaLaunch -EnvName $CondaEnvF5 -OverridePath $env:VPET_F5_PYTHON `
         -ScriptArgs ("start_server.py --device {0}" -f $Device)
     Write-Ok ("Speaking env: {0}" -f $launch.Source)
@@ -187,7 +188,7 @@ if (-not $SkipSpeaking) {
 if (-not $SkipGaze) {
     $wd = Join-Path $Root "VPet-Gaze\python"
     $script = if ($GazeMock) { "gaze_server_mock.py" } else { "gaze_server.py" }
-    $launch = Build-CondaLaunch -EnvName $CondaEnvF5 -OverridePath $env:VPET_GAZE_PYTHON `
+    $launch = Build-CondaLaunch -EnvName $CondaEnvGaze -OverridePath $env:VPET_GAZE_PYTHON `
         -ScriptArgs $script
     Write-Ok ("Gaze env: {0}" -f $launch.Source)
     Start-BackendWindow -Title "VPet-Gaze :8766" -WorkingDir $wd `
@@ -266,20 +267,10 @@ if ($FaceDetectStarted -and -not $NoFaceBrowser) {
 
 if (-not $SkipAudio) {
     $wd = Join-Path $Root "audio\backend"
-    if (Test-Path -LiteralPath $AudioVenvPython) {
-        $cmd = 'set AUDIO_PORT=8010& "' + $AudioVenvPython + '" main.py'
-        Write-Ok ("Audio env: {0}" -f $AudioVenvPython)
-    } else {
-        Write-Warn "Audio .venv not found. Run audio\setup.bat first (creates backend\.venv)."
-        $UvCmd = Get-Command uv -ErrorAction SilentlyContinue
-        if ($UvCmd) {
-            $cmd = "set AUDIO_PORT=8010& uv run main.py"
-            Write-Ok "Audio fallback: uv run (will create/use .venv on sync)"
-        } else {
-            $cmd = "set AUDIO_PORT=8010& python main.py"
-            Write-Warn "Audio fallback: PATH python"
-        }
-    }
+    $launch = Build-CondaLaunch -EnvName $CondaEnvAudio -OverridePath $env:VPET_AUDIO_PYTHON `
+        -ScriptArgs "main.py"
+    $cmd = 'set AUDIO_PORT=8010& ' + $launch.CommandLine
+    Write-Ok ("Audio env: {0}" -f $launch.Source)
     Start-BackendWindow -Title "VPet-Audio :8010" -WorkingDir $wd -CommandLine $cmd | Out-Null
 } else {
     Write-Step "Skip Audio"

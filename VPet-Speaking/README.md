@@ -11,14 +11,15 @@
 | `XunfeiTtsClient.cs` | 讯飞 WebSocket TTS（可选回退） |
 | `GetMessage.cs` | 合成文本入口 |
 | `f5tts.config` | 本地服务地址 / nfe_step |
-| `Local_model/F5-TTS/Fast_generating/` | `start_server.py` + `fast_gen.py` |
+| `Local_model/F5-TTS/` | 上游 F5-TTS 子模块（`pip install -e .`） |
+| `Local_model/Fast_generating/` | 自研 `start_server.py` + `fast_gen.py` |
 
 ## 使用（推荐流程）
 
 ### 1. 先启动本地 F5 服务（保持窗口不关）
 
 ```powershell
-cd VPet-Speaking\Local_model\F5-TTS\Fast_generating
+cd VPet-Speaking\Local_model\Fast_generating
 python start_server.py
 ```
 
@@ -49,7 +50,22 @@ dotnet run --project VPet-Speaking\SmokeTest\SmokeTest.csproj
 或直接用 Python 客户端：
 
 ```powershell
-python Local_model\F5-TTS\Fast_generating\fast_gen.py "你好啊" --nfe_step 8
+python Local_model\Fast_generating\fast_gen.py "你好啊" --nfe_step 8
+```
+
+## Submodule 初始化（首次克隆后必须）
+
+```powershell
+git submodule update --init --recursive VPet-Speaking/Local_model/F5-TTS
+```
+
+然后在 `F5TTS` 环境安装：
+
+```powershell
+conda activate F5TTS
+cd VPet-Speaking\Local_model\F5-TTS
+pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip install -e .
 ```
 
 ## 配置
@@ -64,7 +80,7 @@ F5TTS_TIMEOUT_MS=30000
 ```
 
 - `NFE_STEP` 越小越快（建议 4~16），过大则延迟上升
-- 参考音色放在 `Local_model/F5-TTS/Fast_generating/ref/`（`*.wav` + 同名 `*.txt`）
+- 参考音色放在 `Local_model/Fast_generating/ref/`（`*.wav` + 同名 `*.txt`）
 
 ## 回退
 

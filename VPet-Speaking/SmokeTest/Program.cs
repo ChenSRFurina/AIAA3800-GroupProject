@@ -10,7 +10,7 @@ if (!await f5.PingAsync())
 {
     Console.WriteLine("ERROR: F5 server not reachable.");
     Console.WriteLine("Start it first:");
-    Console.WriteLine("  python Local_model/F5-TTS/Fast_generating/start_server.py");
+    Console.WriteLine("  python Local_model/Fast_generating/start_server.py");
     return 1;
 }
 

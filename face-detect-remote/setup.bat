@@ -2,6 +2,8 @@
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
+set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
+if not "%VPET_TORCH_INDEX%"=="" set "TORCH_INDEX=%VPET_TORCH_INDEX%"
 
 echo.
 echo ====================================================
@@ -30,7 +32,15 @@ if %errorlevel% neq 0 (
     echo [警告] ffmpeg 安装失败，JPEG 推理仍可用（已内置 torchcodec stub）
 )
 
-echo [3/3] 安装 Python 依赖 ...
+echo [3/4] 安装 PyTorch CUDA 版本 ...
+pip install --upgrade torch torchvision --index-url %TORCH_INDEX%
+if %errorlevel% neq 0 (
+    echo [错误] PyTorch CUDA 安装失败（index: %TORCH_INDEX%）
+    pause
+    exit /b 1
+)
+
+echo [4/4] 安装 Python 依赖 ...
 pip install -r "%~dp0requirements.txt"
 if %errorlevel% neq 0 (
     echo [错误] pip install 失败

@@ -2,6 +2,8 @@
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
+set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
+if not "%VPET_TORCH_INDEX%"=="" set "TORCH_INDEX=%VPET_TORCH_INDEX%"
 
 echo.
 echo ====================================================
@@ -16,21 +18,31 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+conda deactivate
+
 call conda activate FACE 2>nul
 if %errorlevel% neq 0 (
-    echo [1/3] create conda env FACE python=3.13 ...
-    call conda create -n FACE python=3.13 -y
+    echo [1/3] create conda env FACE python=3.12 ...
+    call conda create -n FACE python=3.12 -y
     if %errorlevel% neq 0 exit /b 1
     call conda activate FACE
 )
 
-echo [2/3] install ffmpeg from conda-forge ...
-call conda install -y ffmpeg -c conda-forge
+echo [2/3] install ffmpeg
+call conda install -y ffmpeg
 if %errorlevel% neq 0 (
     echo [WARN] ffmpeg install failed; JPEG infer may still work
 )
 
-echo [3/3] 安装 Python 依赖 ...
+echo [3/4] 安装 PyTorch CUDA 版本 ...
+pip install --upgrade torch torchvision --index-url %TORCH_INDEX%
+if %errorlevel% neq 0 (
+    echo [错误] PyTorch CUDA 安装失败（index: %TORCH_INDEX%）
+    pause
+    exit /b 1
+)
+
+echo [4/4] 安装 Python 依赖 ...
 pip install -r "%~dp0requirements.txt"
 if %errorlevel% neq 0 (
     echo [错误] pip install 失败

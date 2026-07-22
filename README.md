@@ -13,10 +13,10 @@
 | 模块 | 目录 | 端口 | Conda / 环境 |
 |------|------|------|----------------|
 | Speaking（F5-TTS） | `VPet-Speaking` | TCP `8765` | conda `F5TTS` |
-| Gaze（视线） | `VPet-Gaze` | HTTP `8766` | conda `F5TTS` |
+| Gaze（视线） | `VPet-Gaze` | HTTP `8766` | conda `GAZE` |
 | FaceDetect（本地） | `face-detect-local` + `VPet-FaceDetect` | HTTP/WS `8000` | conda `FACE` |
 | FaceDetect（远程） | `face-detect-remote` relay + 远端 GPU 服务器 | 本地 `:8000` → 远程 | conda `FACE`（仅 relay） |
-| Audio（语音助手） | `audio` + `VPet-Audio` | HTTP `8010` | `audio/backend/.venv`（`setup.bat`） |
+| Audio（语音助手） | `audio` + `VPet-Audio` | HTTP `8010` | conda `AUDIO` |
 
 C# 插件编译后自动部署到 `VPet-Simulator.Windows/mod/12xx~15xx_*/plugin/`。  
 **仓库不提交** `.env`、`bin/obj`、插件 `*.dll`、模型权重；克隆后需本地配置并编译。
@@ -28,6 +28,7 @@ C# 插件编译后自动部署到 `VPet-Simulator.Windows/mod/12xx~15xx_*/plugin
 ```powershell
 git clone https://github.com/ChenSRFurina/AIAA3800.git
 cd AIAA3800
+git submodule update --init --recursive VPet-Speaking/Local_model/F5-TTS
 ```
 
 ---
@@ -66,26 +67,34 @@ DeepSeek Key：[platform.deepseek.com/api_keys](https://platform.deepseek.com/ap
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
 - [Git](https://git-scm.com/)
 - [Miniconda / Anaconda](https://docs.conda.io/)
-- Python 依赖按模块用 conda / uv 安装（见下）
+- Python 依赖按模块用 conda + pip 安装（见下）
 
 ```powershell
 dotnet --version   # >= 8
 conda --version
 ```
 
-### 3.2 Speaking + Gaze → conda `F5TTS`
+### 3.2 Speaking & Gaze
+
+### 3.2.1 Speaking → conda `F5TTS`
 
 ```powershell
+# F5-TTS（需完整 Local_model/F5-TTS，含 src；见各模块 README）
 conda create -n F5TTS python=3.11 -y
 conda activate F5TTS
 conda install ffmpeg -y
-
-# F5-TTS（需完整 Local_model/F5-TTS，含 src；见各模块 README）
+pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 cd VPet-Speaking\Local_model\F5-TTS
 pip install -e .
+```
 
+### 3.2.2 Gaze → conda `GAZE`
+
+```
 # Gaze：必须 mediapipe==0.10.21（新版本无 mp.solutions）
 cd ..\..\..\VPet-Gaze
+conda create -n GAZE python=3.11 -y
+conda activate GAZE
 pip install -r requirements.txt
 ```
 
@@ -95,19 +104,22 @@ pip install -r requirements.txt
 cd face-detect-local
 .\setup.bat
 # 将 RetinaFace 权重放到 face-detect-local\model\model.safetensors（见 model\README.md）
-# 或：conda create -n FACE python=3.13 -y
+# 或：conda create -n FACE python=3.12 -y
 #     conda activate FACE
+#     pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu130
 #     pip install -r requirements.txt
 ```
 
 RetinaFace 默认读本地 `face-detect-local/model/model.safetensors`；multitask 权重未放本地时走镜像 `HF_ENDPOINT=https://hf-mirror.com`（`face-detect-local/run_backend.bat` / `server.py`）。
 
-### 3.4 Audio → `uv` + `.venv`
+### 3.4 Audio → conda `AUDIO`
 
 ```powershell
 cd audio
+conda create -n AUDIO python=3.13 -y
+conda activate AUDIO
 .\setup.bat
-# 会在 audio\backend\.venv 安装依赖；请确保根目录 .env 已填 DEEPSEEK_API_KEY
+# 使用当前 conda 环境的 python/pip 安装依赖；请确保根目录 .env 已填 DEEPSEEK_API_KEY
 ```
 
 ---
@@ -133,6 +145,7 @@ cd VPet-Simulator.Windows
 ```
 
 否则 Debug 输出目录找不到 Core 模组。
+重复执行 `mklink.bat` 时，若看到“已存在”或 `[SKIP]` 属于正常现象；建议先完成 `dotnet build` 再运行该脚本。
 
 ---
 
@@ -158,10 +171,10 @@ cd VPet-Simulator.Windows
 
 环境约定（`start-all.ps1`）：
 
-- Speaking / Gaze → conda `F5TTS`
+- Speaking → conda `F5TTS`；Gaze → conda `GAZE`
 - FaceDetect（默认）→ `face-detect-local` + conda `FACE`
 - FaceDetect（`-Remote`）→ `face-detect-remote` relay，不跑本地推理
-- Audio → `audio\backend\.venv`
+- Audio → conda `AUDIO`
 
 **远程人脸检测**（本机无 GPU / 模型在服务器上）：
 
@@ -176,7 +189,7 @@ relay 仍监听本机 `127.0.0.1:8000`，VPet 与测试页无需改地址。
 ```powershell
 # Speaking :8765
 conda activate F5TTS
-cd VPet-Speaking\Local_model\F5-TTS\Fast_generating
+cd VPet-Speaking\Local_model\Fast_generating
 python start_server.py --device cuda
 
 # Gaze :8766
@@ -197,8 +210,9 @@ cd face-detect-remote
 .\run_relay.bat
 
 # Audio :8010
+conda activate AUDIO
 cd audio\backend
-.\.venv\Scripts\python.exe main.py
+python main.py
 
 # 前端
 .\VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows\VPet-Simulator.Windows.exe
@@ -240,6 +254,16 @@ Debug 可加载未签名插件；Release 可能需开启「通过模组 / PassMO
 | FaceDetect 远程连不上 | 检查 `FACE_REMOTE_URL`、防火墙、GPU 服务器 `http://IP:8000/health` |
 | Audio 缺 `DEEPSEEK_API_KEY` | 填写根目录 `.env` |
 | 端口占用 | Speaking `8765` / Gaze `8766` / Face `8000` / Audio `8010` 勿冲突 |
+
+若仍提示 `Missing module Core, can't start up`：
+
+```powershell
+cd VPet-Simulator.Windows\bin\x64\Debug\net8.0-windows
+ren mod mod.localbak
+mklink /J mod ..\..\..\..\mod
+```
+
+然后重新运行 `start-all.bat`。
 
 ---
 

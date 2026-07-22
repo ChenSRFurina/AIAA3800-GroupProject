@@ -33,9 +33,14 @@ from omegaconf import OmegaConf
 
 
 HERE = Path(__file__).resolve().parent
-F5_ROOT = HERE.parent
+F5_ROOT = HERE.parent / "F5-TTS"
 SRC = F5_ROOT / "src"
 TEMP_DIR = HERE / "temp"
+if not SRC.is_dir():
+    raise FileNotFoundError(
+        "未找到 F5-TTS 源码目录 src。请先在仓库根目录执行: "
+        "git submodule update --init --recursive VPet-Speaking/Local_model/F5-TTS"
+    )
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
