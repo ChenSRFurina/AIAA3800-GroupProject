@@ -126,6 +126,15 @@ def _on_voice_transcript(text: str) -> None:
     })
 
 
+def _on_voice_speech_start() -> None:
+    """用户开始说话瞬间回调 — 供 Speaking 立即中断当前 TTS。"""
+    voice_messages.append({
+        "type": "user_start",
+        "content": "1",
+        "source": "voice",
+    })
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global agent_instance, voice_assistant, memory_manager
@@ -143,8 +152,6 @@ async def lifespan(app: FastAPI):
     memory_dir = DEFAULT_MEMORY_DIR
     memory_dir.mkdir(parents=True, exist_ok=True)
     memory_manager = LayeredMemoryManager(storage_dir=memory_dir)
-    print(f"[Memory] 长期记忆目录: {memory_dir}")
-    print(f"[Memory] 默认文件: {memory_dir / (DEFAULT_MEMORY_USER + '.json')}")
 
     agent_instance = Agent(
         session_id="web-session",
@@ -177,31 +184,22 @@ async def lifespan(app: FastAPI):
 
     # 启动语音助手 (可选)
     if _VOICE_AVAILABLE:
-        print("\n" + "=" * 50)
-        print_status()
-        print("=" * 50 + "\n")
-
         cfg = VoiceConfig()
         # 使用 Agent 而非本地 Qwen (无需下载 GGUF 模型)
         voice_assistant = VoiceAssistant(
             config=cfg,
             on_response=_on_voice_response,
             on_transcript=_on_voice_transcript,
+            on_speech_start=_on_voice_speech_start,
             use_agent=True,  # 使用 DeepSeek Agent 生成回复
         )
         voice_assistant.agent = agent_instance
         voice_assistant.start()
-        print("[Main] 语音助手已启动 (Agent 模式)")
-    else:
-        print("[Main] 语音模块未加载，跳过语音功能")
-
-    print("Starting Agentic-Desktop-Pet")
     yield
 
     # 清理
     if voice_assistant:
         voice_assistant.stop()
-    print("Stopping Agentic-Desktop-Pet")
 
 
 app = FastAPI(
@@ -227,11 +225,6 @@ async def health_check():
 
 def format_sse_event(data: dict) -> str:
     """将数据格式化为 SSE 格式"""
-    try:
-        print("SSE Event:", data)
-    except UnicodeEncodeError:
-        # Windows GBK console can't print emoji — silently skip
-        pass
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -298,6 +291,8 @@ async def chat_reply(request: Request):
         # agent.run 为同步阻塞调用，放到线程池避免卡住事件循环
         reply = await asyncio.to_thread(agent_instance.run, user_input)
         reply_text = (reply or "").strip()
+        # if reply_text:
+        #     print(f"[LLM] output: {reply_text}")
 
         if memory_manager is not None and reply_text:
             memory_manager.remember_agent_reply(
@@ -404,6 +399,8 @@ async def chat_care(request: Request):
 
         raw = await asyncio.to_thread(_call)
         reply = sanitize_care_reply(raw)
+        # if reply:
+        #     print(f"[LLM] output: {reply}")
         mem_used = bool(memory_text and memory_text != "暂无历史信息")
         if not reply:
             reply = _fallback()
@@ -469,6 +466,7 @@ async def memory_voice_event(request: Request):
         return {"ok": False, "error": "text empty"}
 
     if event_type == "user":
+        print(f"[Voice] user: {text}")
         entry = memory_manager.remember_voice_utterance(
             DEFAULT_MEMORY_USER,
             text,
@@ -496,6 +494,8 @@ async def memory_voice_event(request: Request):
             source_conversation_id=source,
             category=category,
         )
+        if entry:
+            print(f"[LLM] output: {payload}")
         return {"ok": True, "stored": bool(entry)}
 
     return {"ok": False, "error": "event_type must be user|assistant"}

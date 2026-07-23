@@ -68,67 +68,24 @@ if %errorlevel% neq 0 (
 echo   依赖安装完成 ✓
 cd ..
 
-:: 3.5 Repair broken click installation (seen on some Windows pip states)
-echo [3.5/6] 检查 click 包完整性 ...
+:: 4. Preload STT backend/model
+echo [4/6] 预热 STT 后端模型 ...
 cd backend
-python -c "import click,sys; sys.exit(0 if hasattr(click, 'command') else 1)" >nul 2>&1
+python -c "import os; from audio import VoiceConfig; from whisper_stt_factory import create_whisper_stt; cfg=VoiceConfig(); cfg.model_cache_dir=os.path.join('..','models'); cfg.whisper_backend=os.getenv('VPET_WHISPER_BACKEND', cfg.whisper_backend); stt=create_whisper_stt(cfg); stt.preload(); print(f'STT ready: backend={cfg.whisper_backend}')" 2>&1
 if %errorlevel% neq 0 (
-    echo   [修复] 检测到 click 包异常，强制重装 click==8.4.2 ...
-    python -m pip install --upgrade --force-reinstall click==8.4.2
-    if %errorlevel% neq 0 (
-        echo   [错误] click 修复失败，请重试 setup.bat
-        cd ..
-        pause
-        exit /b 1
-    )
-)
-
-python -c "import h11,sys; sys.exit(0 if hasattr(h11, 'Request') else 1)" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo   [修复] 检测到 h11/http 栈异常，重装 h11/httpcore/httpx/huggingface_hub ...
-    python -m pip install --upgrade --force-reinstall h11==0.16.0 httpcore==1.0.9 httpx==0.28.1 huggingface_hub==1.24.0
-    if %errorlevel% neq 0 (
-        echo   [错误] h11/http 栈修复失败，请重试 setup.bat
-        cd ..
-        pause
-        exit /b 1
-    )
-)
-
-python -c "from transformers import pipeline; import PIL; import sys; sys.exit(0)" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo   [修复] 检测到 transformers/PIL 导入异常，重装 pillow + transformers + accelerate ...
-    python -m pip install --upgrade --force-reinstall pillow "transformers<5" accelerate
-    if %errorlevel% neq 0 (
-        echo   [错误] transformers/PIL 修复失败，请重试 setup.bat
-        cd ..
-        pause
-        exit /b 1
-    )
-)
-cd ..
-
-:: 4. Download whisper model
-echo [4/6] 下载 Whisper 语音模型 ...
-cd backend
-python -c "from audio import WhisperSTT, VoiceConfig; import os; cfg = VoiceConfig(); cfg.model_cache_dir = os.path.join('..', 'models'); cfg.whisper_backend = os.getenv('VPET_WHISPER_BACKEND', 'faster'); stt = WhisperSTT(cfg); stt._load(); print('Model ready')" 2>&1
-if %errorlevel% neq 0 (
-    echo   [警告] Whisper 模型下载失败
-    echo   语音功能将不可用，文字聊天不受影响
+    echo   [警告] STT 预热失败（可稍后运行时自动加载/回退）
 )
 cd ..
 
 :: 5. Configure API key file
 echo [5/6] 配置 DeepSeek API Key ...
-cd backend
-if not exist .env (
-    copy .env.example .env >nul 2>&1
-    echo   已创建 .env 文件，请编辑 backend\.env 填入你的 API Key
+if not exist ..\.env (
+    copy ..\.env.example ..\.env >nul 2>&1
+    echo   已创建根目录 .env 文件，请编辑 ..\.env 填入你的 API Key
     echo   获取 Key: https://platform.deepseek.com/api_keys
 ) else (
-    echo   .env 文件已存在 ✓
+    echo   根目录 .env 文件已存在 ✓
 )
-cd ..
 
 :: 6. Check Godot
 echo [6/6] 检查 Godot 引擎 ...
@@ -154,7 +111,9 @@ echo ==================================================
 echo 安装完成
 echo 启动方式:
 echo   1. 双击 run_backend.bat 启动后端
-echo   2. 用 Godot 打开 godot\ 文件夹运行 F5
+echo   2. 默认 STT 后端为 qwen3；可用 VPET_WHISPER_BACKEND=torch^|faster 覆盖
+echo   3. Qwen3-ASR 模型可用 VPET_QWEN3_ASR_MODEL 覆盖
+echo   4. 用 Godot 打开 godot\ 文件夹运行 F5
 echo ==================================================
 echo.
 pause

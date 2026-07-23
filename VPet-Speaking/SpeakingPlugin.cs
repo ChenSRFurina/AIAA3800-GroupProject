@@ -197,6 +197,13 @@ namespace VPet.Plugin.Speaking
                         {
                             var type = msg.TryGetProperty("type", out var t) ? t.GetString() : "";
                             var content = msg.TryGetProperty("content", out var c) ? c.GetString() : "";
+
+                            if (string.Equals(type, "user_start", StringComparison.OrdinalIgnoreCase))
+                            {
+                                NotifyUserSpeechStart();
+                                continue;
+                            }
+
                             if (string.IsNullOrWhiteSpace(content))
                                 continue;
 
@@ -231,7 +238,7 @@ namespace VPet.Plugin.Speaking
 
                 try
                 {
-                    await Task.Delay(600, token).ConfigureAwait(false);
+                    await Task.Delay(120, token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -395,6 +402,18 @@ namespace VPet.Plugin.Speaking
             TryInterruptEmotionCare("user_started_speaking", cleaned);
             TryInterruptUserReply("user_started_speaking", cleaned);
             _ = ReportUserSpeechMemoryAsync(cleaned);
+        }
+
+        private void NotifyUserSpeechStart()
+        {
+            lock (_stateLock)
+            {
+                _userSpeechVersion++;
+                _lastUserSpeechUtc = DateTime.UtcNow;
+            }
+
+            TryInterruptEmotionCare("user_started_speaking", "");
+            TryInterruptUserReply("user_started_speaking", "");
         }
 
         private bool IsRecentUserSpeechActive()

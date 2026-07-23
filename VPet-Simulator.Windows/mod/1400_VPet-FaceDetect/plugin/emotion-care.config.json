@@ -40,10 +40,10 @@
     "surprise": {
       "minScore": 0.30,
       "burstThreshold": 0.70,
-      "burstMinDurationSeconds": 0.23,
+      "burstMinDurationSeconds": 0.5,
       "sustainedThreshold": 0.30,
       "sustainedDurationSeconds": 0.65,
-      "legacyHoldSeconds": 0.55
+      "legacyHoldSeconds": 0.1
     },
     "disgust": {
       "minScore": 0.11,

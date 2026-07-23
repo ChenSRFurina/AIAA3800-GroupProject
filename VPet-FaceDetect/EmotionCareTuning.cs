@@ -53,16 +53,13 @@ public sealed class EmotionCareTuning
                     continue;
 
                 MergeWithDefaults(loaded, tuning);
-                Console.WriteLine($"[VPet-FaceDetect] loaded tuning: {path}");
                 return loaded;
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[VPet-FaceDetect] tuning load failed at {path}: {ex.Message}");
+            catch (Exception ex) {
+				Console.WriteLine("Exception" + ex.ToString());
             }
         }
 
-        Console.WriteLine("[VPet-FaceDetect] tuning file not found, using defaults");
         return tuning;
     }
 

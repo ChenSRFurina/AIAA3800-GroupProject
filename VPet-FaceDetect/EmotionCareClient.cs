@@ -30,7 +30,6 @@ public sealed class EmotionCareClient : IDisposable
     /// <summary>本轮连续情绪是否已经说过（同一情绪连续出现不再说）。</summary>
     private bool _spokenForHoldScene;
     private double _lastGlobalSpeakUnix;
-    private double _lastDiagUnix;
     private readonly Queue<EmotionSnapshot> _emotionWindow = new();
     private SmoothedEmotion _smoothed = new();
 
@@ -88,9 +87,6 @@ public sealed class EmotionCareClient : IDisposable
         ResetHold();
         _cts = new CancellationTokenSource();
         _loopTask = Task.Run(() => PollLoopAsync(_cts.Token));
-        Console.WriteLine(
-            "[VPet-FaceDetect] emotion care started "
-            + $"(poll {FaceDetectConfig.PollIntervalMs}ms → /chat/care → SpeakExternal).");
     }
 
     public void Stop()
@@ -103,7 +99,6 @@ public sealed class EmotionCareClient : IDisposable
         _cts = null;
         _loopTask = null;
         ResetHold();
-        Console.WriteLine("[VPet-FaceDetect] emotion care stopped.");
     }
 
     private void ResetHold()
@@ -379,7 +374,7 @@ public sealed class EmotionCareClient : IDisposable
             {
                 _failureCount++;
                 if (_failureCount == 1 || _failureCount % 40 == 0)
-                    Console.WriteLine($"[VPet-FaceDetect] poll failed: {ex.Message}");
+                    Console.WriteLine($"[VPet-FaceDetect] error: poll failed: {ex.Message}");
             }
 
             try
@@ -406,7 +401,6 @@ public sealed class EmotionCareClient : IDisposable
 
         if (latest is not { Valid: true })
         {
-            MaybeDiag(latest, "invalid");
             ResetHold();
             return;
         }
@@ -418,7 +412,6 @@ public sealed class EmotionCareClient : IDisposable
             || !string.IsNullOrWhiteSpace(latest.DominantEmotion);
         if (!hasSignal)
         {
-            MaybeDiag(latest, "no_face_or_emotion");
             ResetHold();
             return;
         }
@@ -430,34 +423,27 @@ public sealed class EmotionCareClient : IDisposable
         // 放宽新鲜度，避免时钟/卡顿误判
         if (age > _tuning.LatestMaxAgeSeconds)
         {
-            MaybeDiag(latest, $"stale age={age:0.0}s");
             ResetHold();
             return;
         }
 
         var scene = ResolveScene(latest);
         AddEmotionSample(latest, now);
-        MaybeDiag(latest, scene == null ? "neutral" : $"hold:{scene}");
+        Console.WriteLine(
+            $"[Emotion] input: scene={(scene ?? "neutral")} emotion={latest.TopEmotion}/{latest.DominantEmotion} "
+            + $"p={latest.TopProbability:0.00} fatigue={latest.FatigueScore:0.00}/{latest.FatigueLevel}");
 
         // Neutral / 无场景：结束本轮，允许下次再出现同情绪时再说
-        if (scene == null)
-        {
-            if (_holdScene != null)
-                Console.WriteLine($"[VPet-FaceDetect] emotion cleared (was {_holdScene})");
+        if (scene == null) {
             ResetHold();
             return;
         }
 
         // 情绪切换（含 Neutral→Anger、Anger→Happy）：新开一轮，可说话
-        if (_holdScene != scene)
-        {
+        if (_holdScene != scene) {
             _holdScene = scene;
             _holdStartedUnix = now;
             _spokenForHoldScene = false;
-            Console.WriteLine(
-                $"[VPet-FaceDetect] emotion edge → {scene} "
-                + $"emotion={latest.TopEmotion}/{latest.DominantEmotion} "
-                + $"p={latest.TopProbability:0.00}");
         }
 
         // 同一情绪连续：本轮已说过则跳过
@@ -465,17 +451,13 @@ public sealed class EmotionCareClient : IDisposable
             return;
 
         if (IsUserReplyPriorityActive())
-        {
-            Console.WriteLine("[VPet-FaceDetect] care skipped: user-reply-priority");
             return;
-        }
 
         if (!ShouldTriggerCare(scene, now, out var triggerMode))
             return;
 
         if (now - _lastGlobalSpeakUnix < _tuning.GlobalCooldownSeconds)
         {
-            Console.WriteLine("[VPet-FaceDetect] care skipped: global cooldown");
             return;
         }
 
@@ -489,8 +471,6 @@ public sealed class EmotionCareClient : IDisposable
             var emotionSummary = BuildEmotionWindowSummary(now);
             var (interruptionContext, recentUserSpeech) = ReadSpeakingContext();
 
-            Console.WriteLine(
-                $"[VPet-FaceDetect] → POST /chat/care scene={scene} (+memory context)");
             var reply = await RequestCareReplyAsync(
                     scene,
                     hint,
@@ -501,37 +481,18 @@ public sealed class EmotionCareClient : IDisposable
                 .ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(reply))
             {
-                Console.WriteLine("[VPet-FaceDetect] /chat/care returned empty");
                 return;
             }
 
             SpeakViaSpeakingPlugin(reply, scene);
             _spokenForHoldScene = true;
             _lastGlobalSpeakUnix = UnixNow();
-            Console.WriteLine($"[VPet-FaceDetect] care spoken scene={scene}: {reply}");
+            Console.WriteLine($"[LLM] output: {reply}");
         }
         finally
         {
             _busyCare = false;
         }
-    }
-
-    private void MaybeDiag(LatestDto? latest, string reason)
-    {
-        var now = UnixNow();
-        if (now - _lastDiagUnix < 5.0)
-            return;
-        _lastDiagUnix = now;
-        if (latest == null)
-        {
-            Console.WriteLine($"[VPet-FaceDetect] diag: {reason}");
-            return;
-        }
-
-        Console.WriteLine(
-            $"[VPet-FaceDetect] diag {reason} valid={latest.Valid} faces={latest.FacesCount} "
-            + $"emotion={latest.TopEmotion}/{latest.DominantEmotion} p={latest.TopProbability:0.00} "
-            + $"fatigue={latest.FatigueScore:0.00}/{latest.FatigueLevel} ts={latest.Timestamp:0}");
     }
 
     private static double UnixNow() =>

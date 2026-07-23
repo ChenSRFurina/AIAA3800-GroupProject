@@ -33,13 +33,11 @@ public sealed class FaceDetectPlugin : MainPlugin
                 if (_careClient is { IsRunning: false })
                 {
                     _careClient.Start();
-                    Console.WriteLine("[VPet-FaceDetect] auto-started emotion care");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine(
-                    $"[VPet-FaceDetect] auto-start skipped (face service offline): {ex.Message}");
+                Console.WriteLine($"[VPet-FaceDetect] error: auto-start skipped (face service offline): {ex.Message}");
             }
         });
     }
@@ -133,7 +131,6 @@ public sealed class FaceDetectPlugin : MainPlugin
                     MW.Main.SayRnd(
                         $"本机 :8000 在线 {care}。{latestHint}".Translate(),
                         force: true));
-                Console.WriteLine($"[VPet-FaceDetect] health={health} latest={latestHint}");
             }
             catch (Exception ex)
             {

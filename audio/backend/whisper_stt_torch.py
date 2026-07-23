@@ -51,6 +51,9 @@ class TorchWhisperSTT(BaseWhisperSTT):
         if mirror and not os.getenv("HF_ENDPOINT"):
             os.environ["HF_ENDPOINT"] = mirror
 
+    def preload(self) -> None:
+        self._load()
+
     def _load(self) -> None:
         if self._model is not None:
             return
@@ -91,31 +94,13 @@ class TorchWhisperSTT(BaseWhisperSTT):
         if language:
             kwargs["language"] = language
 
-        initial_prompt = self.resolve_initial_prompt() if self.use_initial_prompt() else ""
-        if initial_prompt:
-            kwargs["initial_prompt"] = initial_prompt
-
-        try:
-            result = self._model(
-                wav_path,
-                generate_kwargs=kwargs,
-                return_timestamps=False,
-            )
-        except Exception as exc:
-            if "initial_prompt" in kwargs:
-                print(f"[WhisperSTT] torch initial_prompt unsupported, fallback without prompt: {exc}")
-                kwargs.pop("initial_prompt", None)
-                result = self._model(
-                    wav_path,
-                    generate_kwargs=kwargs,
-                    return_timestamps=False,
-                )
-            else:
-                raise
+        result = self._model(
+            wav_path,
+            generate_kwargs=kwargs,
+            return_timestamps=False,
+        )
 
         text = (result.get("text") or "").strip()
-        if self.looks_like_prompt_leak(text):
-            return ""
         return text
 
     def transcribe(self, wav_bytes: bytes, cancel_event: Any | None = None) -> str:
@@ -132,16 +117,8 @@ class TorchWhisperSTT(BaseWhisperSTT):
             if self.is_cancelled(cancel_event):
                 return ""
 
-            allowed = self.resolve_allowed_languages()
-            mode = self.resolve_language_mode()
-            if mode == "force":
-                lang = self.resolve_force_language(allowed)
-                text = self._decode(tmp.name, language=lang)
-                if self.is_cancelled(cancel_event):
-                    return ""
-                return collapse_repetitive_transcript(text)
-
-            text = self._decode(tmp.name, language=None)
+            lang = self.resolve_language()
+            text = self._decode(tmp.name, language=lang)
             if self.is_cancelled(cancel_event):
                 return ""
             return collapse_repetitive_transcript(text)

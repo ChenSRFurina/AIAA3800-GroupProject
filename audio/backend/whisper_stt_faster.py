@@ -89,6 +89,9 @@ class FasterWhisperSTT(BaseWhisperSTT):
     def _build_model(self, model_path: str, device: str, compute: str) -> Any:
         return WhisperModel(model_path, device=device, compute_type=compute)
 
+    def preload(self) -> None:
+        self._load()
+
     def _download_model(self) -> str:
         import httpx
 
@@ -182,16 +185,10 @@ class FasterWhisperSTT(BaseWhisperSTT):
         }
         if language:
             kwargs["language"] = language
-        if self.use_initial_prompt():
-            prompt = self.resolve_initial_prompt()
-            if prompt:
-                kwargs["initial_prompt"] = prompt
 
         segments, _info = self._model.transcribe(wav_path, **kwargs)
         seg_list = list(segments)
         text = " ".join(seg.text.strip() for seg in seg_list).strip()
-        if self.looks_like_prompt_leak(text):
-            return ""
         return text
 
     def transcribe(self, wav_bytes: bytes, cancel_event: Any | None = None) -> str:
@@ -209,16 +206,8 @@ class FasterWhisperSTT(BaseWhisperSTT):
                 return ""
 
             try:
-                allowed = self.resolve_allowed_languages()
-                mode = self.resolve_language_mode()
-                if mode == "force":
-                    lang = self.resolve_force_language(allowed)
-                    text = self._decode(tmp.name, language=lang)
-                    if self.is_cancelled(cancel_event):
-                        return ""
-                    return collapse_repetitive_transcript(text)
-
-                text = self._decode(tmp.name, language=None)
+                lang = self.resolve_language()
+                text = self._decode(tmp.name, language=lang)
                 if self.is_cancelled(cancel_event):
                     return ""
                 return collapse_repetitive_transcript(text)
@@ -226,8 +215,7 @@ class FasterWhisperSTT(BaseWhisperSTT):
                 if self.cfg.whisper_device.startswith("cuda") and is_whisper_cuda_runtime_error(exc):
                     model_path = self._download_model()
                     self._fallback_to_cpu(model_path, exc)
-                    allowed = self.resolve_allowed_languages()
-                    lang = self.resolve_force_language(allowed)
+                    lang = self.resolve_language()
                     text = self._decode(tmp.name, language=lang)
                     if self.is_cancelled(cancel_event):
                         return ""

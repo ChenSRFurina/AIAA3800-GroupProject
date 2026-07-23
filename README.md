@@ -120,8 +120,10 @@ conda create -n AUDIO python=3.11 -y
 conda activate AUDIO
 .\setup.bat
 # 使用当前 conda 环境的 python/pip 安装依赖；请确保根目录 .env 已填 DEEPSEEK_API_KEY
-# Windows 下 torch Whisper 后端会通过 cu130 源安装 torch；可用 VPET_TORCH_INDEX 覆盖
-# 默认使用 faster-whisper；可用 VPET_WHISPER_BACKEND=torch 切到 torch Whisper
+# Windows 下 torch/qwen3 依赖会通过 cu130 源安装 torch；可用 VPET_TORCH_INDEX 覆盖
+# 默认 STT 后端为 qwen3；可用 VPET_WHISPER_BACKEND=torch|faster|qwen3 覆盖
+# Qwen3 模型可用 VPET_QWEN3_ASR_MODEL 覆盖（例如 Qwen/Qwen3-ASR-1.7B）
+# 可选: VPET_QWEN3_FORCED_ALIGNER=Qwen/Qwen3-ForcedAligner-0.6B
 ```
 
 ---

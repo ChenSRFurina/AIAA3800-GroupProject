@@ -1,19 +1,9 @@
 from __future__ import annotations
 
 import os
-import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
-
-
-KNOWN_PROMPT_LEAKS = [
-    "请将语音准确转写为简体中文文本",
-    "语音准确转写为简体中文文本",
-    "准确转写为简体中文文本",
-    "transcribe speech accurately in english text",
-    "speech accurately in english text",
-]
 
 
 class BaseWhisperSTT(ABC):
@@ -25,6 +15,10 @@ class BaseWhisperSTT(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, cancel_event: Any | None = None) -> str:
         """Transcribe WAV bytes into text."""
+
+    def preload(self) -> None:
+        """Eagerly load model resources if the backend supports it."""
+        return
 
     @staticmethod
     def is_cancelled(cancel_event: Any | None) -> bool:
@@ -49,36 +43,19 @@ class BaseWhisperSTT(ABC):
             return forced
         return allowed[0] if allowed else "zh"
 
-    def use_initial_prompt(self) -> bool:
-        raw = os.getenv("VPET_WHISPER_USE_INITIAL_PROMPT")
-        if raw is not None:
-            return raw.strip().lower() in ("1", "true", "yes", "on")
-        return bool(self.cfg.whisper_use_initial_prompt)
+    def resolve_language(self) -> str | None:
+        """Resolve Whisper language selection.
 
-    def resolve_initial_prompt(self) -> str:
-        return (os.getenv("VPET_WHISPER_INITIAL_PROMPT") or self.cfg.whisper_initial_prompt or "").strip()
-
-    @staticmethod
-    def normalize_compare_text(text: str) -> str:
-        if not text:
-            return ""
-        normalized = re.sub(r"\s+", "", text).strip().lower()
-        return re.sub(r"[，。,.!?！？:：;；\-_'\"“”‘’()（）]", "", normalized)
-
-    def looks_like_prompt_leak(self, text: str) -> bool:
-        candidate = self.normalize_compare_text(text)
-        if not candidate:
-            return True
-
-        prompt = self.normalize_compare_text(self.resolve_initial_prompt())
-        if prompt and (candidate == prompt or candidate in prompt or prompt in candidate):
-            return True
-
-        for leak in KNOWN_PROMPT_LEAKS:
-            if candidate == self.normalize_compare_text(leak):
-                return True
-
-        return False
+        force mode uses a fixed language; whitelist mode uses auto-detect for mixed zh/en
+        unless only a single allowed language remains.
+        """
+        allowed = self.resolve_allowed_languages()
+        mode = self.resolve_language_mode()
+        if mode == "force":
+            return self.resolve_force_language(allowed)
+        if len(allowed) == 1:
+            return allowed[0]
+        return None
 
 
 def get_models_dir() -> str:

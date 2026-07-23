@@ -64,6 +64,17 @@ namespace VPet.Plugin.Speaking
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(_timeoutMs);
             var ct = timeoutCts.Token;
+            using var cancelReg = ct.Register(() =>
+            {
+                try
+                {
+                    DropConnection();
+                }
+                catch
+                {
+                    // ignore
+                }
+            });
 
             // 最多重试一次（长连接可能被服务端关掉）
             for (var attempt = 0; attempt < 2; attempt++)
@@ -105,6 +116,11 @@ namespace VPet.Plugin.Speaking
                     }
 
                     return wav;
+                }
+                catch (Exception ex) when (ct.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+                {
+                    DropConnection();
+                    throw new OperationCanceledException("F5 合成已取消", ex, cancellationToken);
                 }
                 catch (Exception ex) when (attempt == 0 && ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
                 {
