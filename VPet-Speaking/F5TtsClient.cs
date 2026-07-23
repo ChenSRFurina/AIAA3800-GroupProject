@@ -175,8 +175,20 @@ namespace VPet.Plugin.Speaking
             {
                 SendJson(stream, new Dictionary<string, object?> { ["cmd"] = "ping" });
                 using var doc = RecvJson(stream);
-                if (!doc.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
                     throw new InvalidOperationException("F5 ping 失败");
+
+                var device = root.TryGetProperty("device", out var d) ? d.GetString() ?? "unknown" : "unknown";
+                var gpu = root.TryGetProperty("gpu_name", out var g) ? g.GetString() ?? "-" : "-";
+                var serverNfe = root.TryGetProperty("default_nfe_step", out var n) ? n.GetInt32() : -1;
+                Console.WriteLine(
+                    $"[VPet-Speaking] F5 ping ok: device={device}, gpu={gpu}, server_nfe={serverNfe}, client_nfe={_nfeStep}");
+
+                if (!device.StartsWith("cuda", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("[VPet-Speaking] WARN: F5 当前未使用 CUDA。可检查 start_server.py --device cuda 与 F5TTS 环境 torch CUDA 版本。");
+                }
             }
         }
 

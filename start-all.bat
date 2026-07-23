@@ -9,7 +9,7 @@ echo   VPet 一键启动（四个后端 + 桌宠前端）
 echo ====================================================
 echo.
 echo   将打开多个窗口:
-echo     [1] Speaking   F5-TTS     :8765
+echo     [1] Speaking   Qwen-TTS   :8765  (默认)
 echo     [2] Gaze       视线跟随   :8766
 echo     [3] FaceDetect 人脸检测   :8000  (默认本地推理)
 echo         + 自动打开浏览器测试页推流
@@ -22,6 +22,8 @@ echo     FaceDetect       -^> conda FACE
 echo     Audio            -^> audio\backend\.venv  (先运行 audio\setup.bat)
 echo.
 echo   可选参数（传给 start-all.ps1）:
+echo     start-all.bat -TtsBackend qwentts
+echo     start-all.bat -TtsBackend f5
 echo     start-all.bat -Remote
 echo     start-all.bat -Remote -FaceRemoteUrl http://192.168.1.10:8000
 echo     start-all.bat -GazeMock

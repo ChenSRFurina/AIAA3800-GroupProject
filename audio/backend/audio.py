@@ -7,6 +7,7 @@
 """
 
 import io
+import importlib
 import os
 import sys
 import wave
@@ -15,6 +16,7 @@ import json
 import atexit
 import threading
 import tempfile
+import ctypes
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -35,12 +37,94 @@ except ImportError:
     _FASTER_WHISPER_AVAILABLE = False
     WhisperModel = None
 
+_TRANSFORMERS_AVAILABLE = True
+try:
+    import torch
+    from transformers import pipeline
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
+    torch = None
+    pipeline = None
+
 _LLAMA_CPP_AVAILABLE = True
 try:
     from llama_cpp import Llama
 except ImportError:
     _LLAMA_CPP_AVAILABLE = False
     Llama = None
+
+
+def _whisper_cuda_available() -> bool:
+    """Best-effort CUDA probe for faster-whisper runtime (CTranslate2 first)."""
+    if os.name == "nt":
+        missing = _missing_windows_cuda_runtime_dlls()
+        if missing:
+            print(f"[WhisperSTT] 缺少 CUDA 运行时 DLL，改用 CPU: {', '.join(missing)}")
+            return False
+
+    try:
+        ct2 = importlib.import_module("ctranslate2")
+        return int(ct2.get_cuda_device_count()) > 0
+    except Exception:
+        pass
+
+    # fallback: torch isn't required by faster-whisper, but can still hint CUDA presence
+    try:
+        torch_mod = importlib.import_module("torch")
+        return bool(torch_mod.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _missing_windows_cuda_runtime_dlls() -> list[str]:
+    if os.name != "nt":
+        return []
+
+    required = [
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+    ]
+    missing: list[str] = []
+    for dll_name in required:
+        try:
+            ctypes.WinDLL(dll_name)
+        except OSError:
+            missing.append(dll_name)
+    return missing
+
+
+def _is_whisper_cuda_runtime_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "cublas64_12.dll",
+        "cublaslt64_12.dll",
+        "cudnn",
+        "cuda",
+        "cannot be loaded",
+        "not found",
+        "failed to create cublas handle",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        return bool(torch is not None and torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _torch_whisper_model_id(name: str) -> str:
+    alias = {
+        "tiny": "openai/whisper-tiny",
+        "base": "openai/whisper-base",
+        "small": "openai/whisper-small",
+        "medium": "openai/whisper-medium",
+        "large": "openai/whisper-large-v3-turbo",
+        "large-v3": "openai/whisper-large-v3",
+        "large-v3-turbo": "openai/whisper-large-v3-turbo",
+    }
+    return alias.get((name or "base").strip().lower(), name)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -60,8 +144,9 @@ class VoiceConfig:
 
     # ── Whisper ──
     whisper_model: str = "base"       # tiny / base / small / medium / large
-    whisper_device: str = "cpu"       # cpu | cuda
-    whisper_compute: str = "int8"     # int8 (CPU) | float16 (GPU) | auto
+    whisper_backend: str = "faster"   # faster | torch | auto
+    whisper_device: str = "auto"      # auto | cpu | cuda
+    whisper_compute: str = "auto"     # auto | int8 (CPU) | float16 (GPU)
 
     # ── Qwen GGUF ──
     qwen_model_path: str = ""          # Qwen GGUF 文件路径 (留空则使用 Agent)
@@ -200,9 +285,8 @@ def _get_models_dir() -> str:
 
 
 class WhisperSTT:
-    """本地离线语音转文字 — 基于 faster-whisper (CTranslate2)。"""
+    """本地离线语音转文字，支持 faster-whisper 与 torch/transformers 两种后端。"""
 
-    # faster-whisper base 模型需要的文件
     _MODEL_FILES = [
         "config.json",
         "model.bin",
@@ -215,25 +299,42 @@ class WhisperSTT:
     def __init__(self, config: VoiceConfig):
         self.cfg = config
         self._model = None
+        self._backend = ""
+
+    def _resolve_backend(self) -> str:
+        backend = (os.getenv("VPET_WHISPER_BACKEND") or self.cfg.whisper_backend or "faster").strip().lower()
+        if backend not in ("", "auto", "faster", "torch"):
+            raise ValueError(f"不支持的 Whisper backend: {backend}")
+        if backend in ("", "auto"):
+            if _TRANSFORMERS_AVAILABLE:
+                return "torch"
+            return "faster"
+        return backend
+
+    def _build_model(self, model_path: str, device: str, compute: str) -> WhisperModel:
+        return WhisperModel(model_path, device=device, compute_type=compute)
+
+    def _fallback_to_cpu(self, model_path: str, reason: Exception) -> None:
+        print(f"[WhisperSTT] CUDA 不可用，回退 CPU: {reason}")
+        self.cfg.whisper_device = "cpu"
+        self.cfg.whisper_compute = "int8"
+        self.cfg.whisper_backend = "faster"
+        self._model = self._build_model(model_path, "cpu", "int8")
 
     def _download_model(self) -> str:
-        """从 HF 镜像直接下载模型文件 (绕过 huggingface_hub 的 Xet 协议)。"""
+        """从 HF 镜像直接下载 faster-whisper 模型文件。"""
         import httpx
 
         cache_dir = self.cfg.model_cache_dir or _get_models_dir()
         model_dir = os.path.join(cache_dir, "faster-whisper-base")
         os.makedirs(model_dir, exist_ok=True)
 
-        # 检查是否已下载完成
-        all_exist = all(
-            os.path.exists(os.path.join(model_dir, f)) for f in self._MODEL_FILES
-        )
+        all_exist = all(os.path.exists(os.path.join(model_dir, f)) for f in self._MODEL_FILES)
         if all_exist:
             print(f"[WhisperSTT] 模型已存在: {model_dir}")
             return model_dir
 
         print(f"[WhisperSTT] 下载模型文件到 {model_dir} …")
-
         for filename in self._MODEL_FILES:
             url = f"{self._MIRROR_BASE}/{self._MODEL_REPO}/resolve/main/{filename}"
             dest = os.path.join(model_dir, filename)
@@ -243,7 +344,7 @@ class WhisperSTT:
                 if filename == "model.bin" and size > 100_000_000:
                     print(f"  [跳过] {filename} ({size / 1024 / 1024:.0f} MB)")
                     continue
-                elif filename != "model.bin":
+                if filename != "model.bin":
                     print(f"  [跳过] {filename}")
                     continue
 
@@ -253,58 +354,135 @@ class WhisperSTT:
                     resp.raise_for_status()
                     total = int(resp.headers.get("content-length", 0))
                     downloaded = 0
-                    with open(dest, "wb") as f:
+                    with open(dest, "wb") as file_obj:
                         for chunk in resp.iter_bytes(chunk_size=8192):
-                            f.write(chunk)
+                            file_obj.write(chunk)
                             downloaded += len(chunk)
                             if total > 0 and downloaded % (total // 20 + 1) < 8192:
                                 pct = downloaded * 100 // total
                                 print(f"    {pct}% ({downloaded / 1024 / 1024:.0f}/{total / 1024 / 1024:.0f} MB)", end="\r")
                     print(f"    100% ({downloaded / 1024 / 1024:.0f} MB) ✓")
-            except Exception as e:
-                print(f"  [失败] {filename}: {e}")
+            except Exception as exc:
+                print(f"  [失败] {filename}: {exc}")
                 raise
 
         print(f"[WhisperSTT] 模型下载完成: {model_dir}")
         return model_dir
 
-    def _load(self) -> None:
-        if self._model is not None:
-            return
+    def _load_faster(self) -> None:
         if not _FASTER_WHISPER_AVAILABLE:
             raise ImportError("请安装 faster-whisper: pip install faster-whisper")
 
-        device = self.cfg.whisper_device
-        compute = self.cfg.whisper_compute
+        device = (os.getenv("VPET_WHISPER_DEVICE") or self.cfg.whisper_device or "auto").strip().lower()
+        compute = (os.getenv("VPET_WHISPER_COMPUTE") or self.cfg.whisper_compute or "auto").strip().lower()
 
-        # 先尝试直接下载模型文件
+        has_cuda = _whisper_cuda_available()
+        if device in ("", "auto"):
+            device = "cuda" if has_cuda else "cpu"
+        if device.startswith("cuda") and not has_cuda:
+            print("[WhisperSTT] 检测到未启用 CUDA，自动回退到 CPU")
+            device = "cpu"
+
+        if compute in ("", "auto"):
+            compute = "float16" if device.startswith("cuda") else "int8"
+
         model_path = self._download_model()
+        print(f"[WhisperSTT] 加载 faster-whisper '{self.cfg.whisper_model}' ({device}/{compute}) …")
+        try:
+            self._model = self._build_model(model_path, device, compute)
+        except Exception as exc:
+            if device.startswith("cuda"):
+                self._fallback_to_cpu(model_path, exc)
+                device = "cpu"
+                compute = "int8"
+            else:
+                raise
 
-        print(f"[WhisperSTT] 加载模型 '{self.cfg.whisper_model}' ({device}/{compute}) …")
-        self._model = WhisperModel(
-            model_path,  # 使用本地路径而非模型名
-            device=device,
-            compute_type=compute,
+        self.cfg.whisper_device = device
+        self.cfg.whisper_compute = compute
+        self.cfg.whisper_backend = "faster"
+
+    def _load_torch(self) -> None:
+        if not _TRANSFORMERS_AVAILABLE:
+            raise ImportError("请安装 transformers 和 torch 以使用 torch Whisper 后端")
+
+        device = (os.getenv("VPET_WHISPER_DEVICE") or self.cfg.whisper_device or "auto").strip().lower()
+        compute = (os.getenv("VPET_WHISPER_COMPUTE") or self.cfg.whisper_compute or "auto").strip().lower()
+
+        has_cuda = _torch_cuda_available()
+        if device in ("", "auto"):
+            device = "cuda" if has_cuda else "cpu"
+        if device.startswith("cuda") and not has_cuda:
+            print("[WhisperSTT] torch CUDA 不可用，自动回退到 CPU")
+            device = "cpu"
+
+        if compute in ("", "auto", "int8"):
+            compute = "float16" if device.startswith("cuda") else "float32"
+
+        model_id = _torch_whisper_model_id(self.cfg.whisper_model)
+        dtype = torch.float16 if compute == "float16" and device.startswith("cuda") else torch.float32
+        pipe_device = 0 if device.startswith("cuda") else "cpu"
+
+        print(f"[WhisperSTT] 加载 torch Whisper '{model_id}' ({device}/{compute}) …")
+        self._model = pipeline(
+            "automatic-speech-recognition",
+            model=model_id,
+            device=pipe_device,
+            torch_dtype=dtype,
         )
+        self.cfg.whisper_device = device
+        self.cfg.whisper_compute = compute
+        self.cfg.whisper_backend = "torch"
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+
+        self._backend = self._resolve_backend()
+        if self._backend == "torch":
+            self._load_torch()
+        else:
+            self._load_faster()
         print("[WhisperSTT] 模型就绪 ✓")
 
     def transcribe(self, wav_bytes: bytes) -> str:
         """将 WAV 字节转写为中文文本。"""
         self._load()
 
-        # faster-whisper 需要文件路径
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
             tmp.write(wav_bytes)
             tmp.close()
-            segments, _info = self._model.transcribe(
-                tmp.name,
-                language="zh",
-                vad_filter=True,
-                beam_size=5,
-            )
-            text = " ".join(seg.text.strip() for seg in segments)
-            return text
+
+            if self._backend == "torch":
+                result = self._model(
+                    tmp.name,
+                    generate_kwargs={"task": "transcribe", "language": "zh"},
+                    return_timestamps=False,
+                )
+                return (result.get("text") or "").strip()
+
+            try:
+                segments, _info = self._model.transcribe(
+                    tmp.name,
+                    language="zh",
+                    vad_filter=True,
+                    beam_size=5,
+                )
+            except Exception as exc:
+                if self.cfg.whisper_device.startswith("cuda") and _is_whisper_cuda_runtime_error(exc):
+                    model_path = self._download_model()
+                    self._fallback_to_cpu(model_path, exc)
+                    segments, _info = self._model.transcribe(
+                        tmp.name,
+                        language="zh",
+                        vad_filter=True,
+                        beam_size=5,
+                    )
+                else:
+                    raise
+
+            return " ".join(seg.text.strip() for seg in segments)
         finally:
             try:
                 os.unlink(tmp.name)
@@ -556,6 +734,7 @@ def check_dependencies() -> dict:
     status = {
         "sounddevice": _SOUNDDEVICE_AVAILABLE,
         "faster_whisper": _FASTER_WHISPER_AVAILABLE,
+        "transformers": _TRANSFORMERS_AVAILABLE,
         "llama_cpp": _LLAMA_CPP_AVAILABLE,
         "numpy": True,  # fastapi 已依赖
     }
@@ -584,6 +763,7 @@ def print_status() -> None:
         label = {
             "sounddevice": "Microphone (sounddevice)",
             "faster_whisper": "Whisper STT (faster-whisper)",
+            "transformers": "Whisper STT (torch/transformers)",
             "llama_cpp": "Qwen Local LLM (llama-cpp)",
             "numpy": "NumPy audio processing",
             "microphone": "Microphone device",

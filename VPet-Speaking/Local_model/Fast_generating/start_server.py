@@ -31,6 +31,13 @@ from cached_path import cached_path
 from hydra.utils import get_class
 from omegaconf import OmegaConf
 
+_QWEN_TTS_AVAILABLE = True
+try:
+    from qwen_tts import Qwen3TTSModel
+except ImportError:
+    _QWEN_TTS_AVAILABLE = False
+    Qwen3TTSModel = None
+
 
 HERE = Path(__file__).resolve().parent
 F5_ROOT = HERE.parent / "F5-TTS"
@@ -63,6 +70,54 @@ logging.basicConfig(
 logger = logging.getLogger("f5_fast_server")
 
 
+QWEN_TTS_VOICE_PRESETS: dict[str, str] = {
+    "young_sister": (
+        "年轻大姐姐声线，20岁出头，音色温柔成熟，咬字清晰自然，"
+        "语速中等，情绪亲切有耐心，像在轻声安慰和陪伴。"
+    ),
+    "loli": (
+        "体现撒娇稚嫩的萝莉女声，音调偏高且起伏明显，"
+        "营造出黏人、做作又刻意卖萌的听觉效果，语速中等偏快。"
+    ),
+}
+
+QWEN_PROFILE_DEFAULT_MAX_NEW_TOKENS: dict[str, int] = {
+    "fast": 1024,
+    "balanced": 1536,
+    "quality": 2048,
+}
+
+_QWEN_PRESET_ALIASES: dict[str, str] = {
+    "young_sister": "young_sister",
+    "young": "young_sister",
+    "姐姐": "young_sister",
+    "年轻大姐姐": "young_sister",
+    "1": "young_sister",
+    "loli": "loli",
+    "萝莉": "loli",
+    "2": "loli",
+}
+
+
+def normalize_qwen_preset(name: str | None) -> str:
+    raw = (name or "").strip().lower()
+    if not raw:
+        return "loli"
+    mapped = _QWEN_PRESET_ALIASES.get(raw, raw)
+    if mapped not in QWEN_TTS_VOICE_PRESETS:
+        raise ValueError(f"未知 qwentts 预设: {name}")
+    return mapped
+
+
+def normalize_qwen_profile(name: str | None) -> str:
+    raw = (name or "").strip().lower()
+    if not raw:
+        return "fast"
+    if raw not in QWEN_PROFILE_DEFAULT_MAX_NEW_TOKENS:
+        raise ValueError(f"未知 qwentts 档位: {name}")
+    return raw
+
+
 def file_md5(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -79,7 +134,7 @@ def resolve_device(preferred: str | None = None, cuda_id: int = 0) -> str:
                 raise RuntimeError(
                     "指定了 GPU 推理，但未检测到 CUDA。\n"
                     "请在 F5TTS 环境中安装 CUDA 版 PyTorch，例如:\n"
-                    "  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124"
+                    "  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130"
                 )
             if ":" in pref:
                 return pref
@@ -475,6 +530,7 @@ class FastTTSServer:
         seed: int | None = None,
         speed: float | None = None,
         cfg_strength: float | None = None,
+        **_ignored,
     ) -> tuple[np.ndarray, int, float]:
         text = (text or "").strip()
         if not text:
@@ -507,7 +563,138 @@ class FastTTSServer:
         return np.asarray(wave, dtype=np.float32), int(sr), infer_s
 
 
-def handle_client(conn: socket.socket, addr, server: FastTTSServer) -> None:
+class QwenTTSServer:
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        default_preset: str,
+        default_language: str,
+        max_new_tokens: int,
+        default_profile: str,
+    ):
+        if not _QWEN_TTS_AVAILABLE:
+            raise ImportError(
+                "未安装 qwen-tts。请在当前环境安装 GPU 版本依赖，例如:\n"
+                "  pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130\n"
+                "  pip install --upgrade qwen-tts --extra-index-url https://download.pytorch.org/whl/cu130\n"
+                "并确保 torch 为 CUDA 版。"
+            )
+        if not device.startswith("cuda"):
+            raise RuntimeError("qwentts 仅支持 GPU 启动，请使用 --device cuda")
+
+        self.device = device
+        self.autocast_dtype = pick_autocast_dtype(device)
+        self.default_nfe_step = 0
+        self.cfg_strength = 0.0
+        self.ref_mel = None
+        self.ref_text = "qwen-voice-design"
+        self.sample_rate = 24000
+        self.lock = threading.Lock()
+
+        self.model_name = model_name
+        self.default_preset = normalize_qwen_preset(default_preset)
+        self.default_profile = normalize_qwen_profile(default_profile)
+        self.default_language = (default_language or "Chinese").strip() or "Chinese"
+        self.default_max_new_tokens = int(max_new_tokens)
+        if self.default_max_new_tokens <= 0:
+            self.default_max_new_tokens = QWEN_PROFILE_DEFAULT_MAX_NEW_TOKENS[self.default_profile]
+
+        setup_cuda(device)
+        logger.info("设备: %s", self.device)
+        logger.info("加载 Qwen-TTS 模型: %s", self.model_name)
+        logger.info("默认预设: %s", self.default_preset)
+        logger.info("默认档位: %s (max_new_tokens=%s)", self.default_profile, self.default_max_new_tokens)
+
+        self.model = self._load_model(self.model_name, self.device)
+        self.warmup()
+
+    def _load_model(self, model_name: str, device: str):
+        load_kwargs = {
+            "device_map": device,
+            "torch_dtype": self.autocast_dtype,
+            "attn_implementation": "flash_attention_2",
+        }
+        try:
+            return Qwen3TTSModel.from_pretrained(model_name, **load_kwargs)
+        except Exception as e:
+            logger.warning("flash_attention_2 加载失败，回退 eager: %s", e)
+            load_kwargs.pop("attn_implementation", None)
+            return Qwen3TTSModel.from_pretrained(model_name, **load_kwargs)
+
+    def _resolve_instruction(self, voice_preset: str | None, voice_instruct: str | None) -> tuple[str, str]:
+        custom = (voice_instruct or "").strip()
+        if custom:
+            return "custom", custom
+        preset = normalize_qwen_preset(voice_preset or self.default_preset)
+        return preset, QWEN_TTS_VOICE_PRESETS[preset]
+
+    def warmup(self) -> None:
+        logger.info("Qwen-TTS GPU 预热中...")
+        t0 = time.perf_counter()
+        self.synthesize("你好，这是一次预热。", voice_preset=self.default_preset)
+        logger.info("Qwen-TTS 预热完成，耗时 %.3fs", time.perf_counter() - t0)
+
+    def synthesize(
+        self,
+        text: str,
+        nfe_step: int | None = None,
+        seed: int | None = None,
+        speed: float | None = None,
+        cfg_strength: float | None = None,
+        voice_preset: str | None = None,
+        voice_instruct: str | None = None,
+        language: str | None = None,
+        max_new_tokens: int | None = None,
+        qwen_profile: str | None = None,
+    ) -> tuple[np.ndarray, int, float]:
+        del nfe_step, speed, cfg_strength
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("生成文本为空")
+
+        if seed is not None:
+            seed_everything(int(seed))
+
+        preset, instruct = self._resolve_instruction(voice_preset, voice_instruct)
+        profile = normalize_qwen_profile(qwen_profile or self.default_profile)
+        use_language = (language or self.default_language).strip() or self.default_language
+        if max_new_tokens is None:
+            use_max_tokens = int(self.default_max_new_tokens or QWEN_PROFILE_DEFAULT_MAX_NEW_TOKENS[profile])
+        else:
+            use_max_tokens = int(max_new_tokens)
+
+        gen_kwargs = {"max_new_tokens": use_max_tokens}
+        if profile == "fast":
+            gen_kwargs.update({"do_sample": False})
+        elif profile == "balanced":
+            gen_kwargs.update({"do_sample": True, "top_p": 0.9})
+        else:
+            gen_kwargs.update({"do_sample": True, "top_p": 0.95})
+
+        t0 = time.perf_counter()
+
+        with self.lock, torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
+                wavs, sr = self.model.generate_voice_design(
+                    text=text,
+                    language=use_language,
+                    instruct=instruct,
+                    **gen_kwargs,
+                )
+
+        infer_s = time.perf_counter() - t0
+
+        wave = np.asarray(wavs[0], dtype=np.float32)
+        if wave.size == 0:
+            raise RuntimeError("合成失败，无音频输出")
+
+        self.sample_rate = int(sr)
+        self.ref_text = f"qwen_voice_preset={preset},profile={profile},max_new_tokens={use_max_tokens}"
+        return wave, int(sr), infer_s
+
+
+def handle_client(conn: socket.socket, addr, server) -> None:
     logger.info("客户端连接: %s", addr)
     try:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -525,6 +712,7 @@ def handle_client(conn: socket.socket, addr, server: FastTTSServer) -> None:
                         {
                             "ok": True,
                             "cmd": "pong",
+                            "backend": "qwentts" if isinstance(server, QwenTTSServer) else "f5",
                             "device": server.device,
                             "autocast_dtype": str(server.autocast_dtype).replace("torch.", ""),
                             "gpu_name": (
@@ -537,16 +725,23 @@ def handle_client(conn: socket.socket, addr, server: FastTTSServer) -> None:
                             "default_nfe_step": server.default_nfe_step,
                             "cfg_strength": server.cfg_strength,
                             "ref_cached": server.ref_mel is not None,
+                            "qwen_default_preset": getattr(server, "default_preset", None),
+                            "qwen_default_profile": getattr(server, "default_profile", None),
+                            "qwen_supported_presets": list(QWEN_TTS_VOICE_PRESETS.keys()),
                         },
                     )
                     continue
 
                 if cmd in ("reload_ref", "reload"):
-                    server.force_rebuild_ref = True
-                    server.load_reference()
-                    server.force_rebuild_ref = False
-                    server.warmup()
-                    send_json(conn, {"ok": True, "cmd": "reload_ref", "ref_text": server.ref_text.strip()})
+                    if isinstance(server, FastTTSServer):
+                        server.force_rebuild_ref = True
+                        server.load_reference()
+                        server.force_rebuild_ref = False
+                        server.warmup()
+                        send_json(conn, {"ok": True, "cmd": "reload_ref", "ref_text": server.ref_text.strip()})
+                    else:
+                        server.warmup()
+                        send_json(conn, {"ok": True, "cmd": "reload_qwentts"})
                     continue
 
                 if cmd not in ("gen", "generate", "tts"):
@@ -559,16 +754,24 @@ def handle_client(conn: socket.socket, addr, server: FastTTSServer) -> None:
                     seed=req.get("seed"),
                     speed=req.get("speed"),
                     cfg_strength=req.get("cfg_strength"),
+                    voice_preset=req.get("voice_preset"),
+                    voice_instruct=req.get("voice_instruct"),
+                    language=req.get("language"),
+                    max_new_tokens=req.get("max_new_tokens"),
+                    qwen_profile=req.get("qwen_profile"),
                 )
                 pcm = wave.astype(np.float32, copy=False).tobytes()
+                payload_dtype = "float32"
+                sample_count = int(wave.size)
+
                 send_json_and_bytes(
                     conn,
                     {
                         "ok": True,
                         "cmd": "gen",
                         "sr": sr,
-                        "dtype": "float32",
-                        "samples": int(wave.size),
+                        "dtype": payload_dtype,
+                        "samples": sample_count,
                         "infer_ms": round(infer_s * 1000.0, 2),
                         "nfe_step": int(req.get("nfe_step") or server.default_nfe_step),
                         "text": req.get("text", ""),
@@ -608,9 +811,10 @@ def serve(host: str, port: int, server: FastTTSServer) -> None:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="F5-TTS Fast Generating Server")
+    p = argparse.ArgumentParser(description="Fast Generating TTS Server (F5 / Qwen-TTS)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--tts_backend", default="f5", choices=["f5", "qwentts"], help="TTS 后端选择")
     p.add_argument("--model", default="F5TTS_v1_Base")
     p.add_argument("--ckpt_file", default="", help="本地权重路径；为空则优先 Local_model/model，再 HuggingFace")
     p.add_argument("--vocab_file", default="")
@@ -631,6 +835,26 @@ def parse_args():
         help="参考音频最长秒数；0=不截断（完整 ref）。仅加速调试时再设为正数",
     )
     p.add_argument("--compile", action="store_true", help="启用 torch.compile（可选）")
+    p.add_argument(
+        "--qwen_model",
+        default="",
+        help="qwentts 模型名或本地路径；留空则根据 --qwen_model_size 自动选择",
+    )
+    p.add_argument(
+        "--qwen_model_size",
+        default="1.7b",
+        choices=["0.6b", "1.7b"],
+        help="qwentts 模型大小，默认 1.7b",
+    )
+    p.add_argument("--qwen_voice_preset", default="loli", help="qwentts 默认预设: young_sister 或 loli")
+    p.add_argument(
+        "--qwen_profile",
+        default="fast",
+        choices=["fast", "balanced", "quality"],
+        help="qwentts 速度档位：fast(更快，默认) / balanced / quality",
+    )
+    p.add_argument("--qwen_language", default="Chinese", help="qwentts 默认语言")
+    p.add_argument("--qwen_max_new_tokens", type=int, default=0, help="qwentts max_new_tokens；0 表示按档位自动")
     return p.parse_args()
 
 
@@ -654,21 +878,37 @@ def main():
             "调试: python start_server.py --allow_cpu"
         )
 
-    server = FastTTSServer(
-        model_name=args.model,
-        ckpt_file=args.ckpt_file,
-        vocab_file=args.vocab_file,
-        ref_dir=Path(args.ref_dir),
-        device=device,
-        default_nfe_step=args.nfe_step,
-        cfg_strength=args.cfg_strength,
-        sway_sampling_coef=args.sway_sampling_coef,
-        speed=args.speed,
-        max_ref_sec=args.max_ref_sec,
-        use_compile=args.compile,
-        temp_dir=Path(args.temp_dir),
-        force_rebuild_ref=args.rebuild_ref,
-    )
+    qwen_model_by_size = {
+        "0.6b": "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign",
+        "1.7b": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    }
+
+    if args.tts_backend == "qwentts":
+        qwen_model = (args.qwen_model or "").strip() or qwen_model_by_size[args.qwen_model_size]
+        server = QwenTTSServer(
+            model_name=qwen_model,
+            device=device,
+            default_preset=args.qwen_voice_preset,
+            default_language=args.qwen_language,
+            max_new_tokens=args.qwen_max_new_tokens,
+            default_profile=args.qwen_profile,
+        )
+    else:
+        server = FastTTSServer(
+            model_name=args.model,
+            ckpt_file=args.ckpt_file,
+            vocab_file=args.vocab_file,
+            ref_dir=Path(args.ref_dir),
+            device=device,
+            default_nfe_step=args.nfe_step,
+            cfg_strength=args.cfg_strength,
+            sway_sampling_coef=args.sway_sampling_coef,
+            speed=args.speed,
+            max_ref_sec=args.max_ref_sec,
+            use_compile=args.compile,
+            temp_dir=Path(args.temp_dir),
+            force_rebuild_ref=args.rebuild_ref,
+        )
     try:
         serve(args.host, args.port, server)
     except KeyboardInterrupt:

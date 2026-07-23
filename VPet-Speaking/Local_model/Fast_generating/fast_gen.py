@@ -70,6 +70,11 @@ def generate(
     nfe_step: int | None = None,
     seed: int | None = None,
     speed: float | None = None,
+    voice_preset: str | None = None,
+    voice_instruct: str | None = None,
+    language: str | None = None,
+    qwen_profile: str | None = None,
+    max_new_tokens: int | None = None,
     out_path: Path | None = None,
     play: bool = False,
 ) -> dict:
@@ -80,6 +85,16 @@ def generate(
         req["seed"] = int(seed)
     if speed is not None:
         req["speed"] = float(speed)
+    if voice_preset is not None and str(voice_preset).strip():
+        req["voice_preset"] = str(voice_preset).strip()
+    if voice_instruct is not None and str(voice_instruct).strip():
+        req["voice_instruct"] = str(voice_instruct).strip()
+    if language is not None and str(language).strip():
+        req["language"] = str(language).strip()
+    if qwen_profile is not None and str(qwen_profile).strip():
+        req["qwen_profile"] = str(qwen_profile).strip()
+    if max_new_tokens is not None:
+        req["max_new_tokens"] = int(max_new_tokens)
 
     t_client0 = time.perf_counter()
     with connect(host, port) as sock:
@@ -169,6 +184,11 @@ def interactive_loop(args) -> None:
                 nfe_step=args.nfe_step,
                 seed=args.seed,
                 speed=args.speed,
+                voice_preset=args.voice_preset,
+                voice_instruct=args.voice_instruct,
+                language=args.language,
+                qwen_profile=args.qwen_profile,
+                max_new_tokens=args.max_new_tokens,
                 out_path=Path(args.output) if args.output else None,
                 play=args.play,
             )
@@ -191,6 +211,11 @@ def parse_args():
     p.add_argument("--interactive", "-i", action="store_true", help="交互输入多句")
     p.add_argument("--ping", action="store_true", help="仅探测服务是否就绪")
     p.add_argument("--bench", type=int, default=0, help="连续测速 N 次（不含首轮预热）")
+    p.add_argument("--voice_preset", default=None, help="qwentts 预设: young_sister / loli")
+    p.add_argument("--voice_instruct", default=None, help="qwentts 自定义音色描述文本（覆盖预设）")
+    p.add_argument("--language", default=None, help="qwentts 语言，例如 Chinese / English")
+    p.add_argument("--qwen_profile", default=None, choices=["fast", "balanced", "quality"], help="qwentts 档位")
+    p.add_argument("--max_new_tokens", type=int, default=None, help="qwentts 生成长度（不传则服务端按档位自动）")
     return p.parse_args()
 
 
@@ -224,7 +249,16 @@ def main():
         if not text:
             text = "你好"
         print(f"预热 1 次...")
-        generate(text, host=args.host, port=args.port, nfe_step=args.nfe_step, seed=args.seed, speed=args.speed)
+        generate(
+            text,
+            host=args.host,
+            port=args.port,
+            nfe_step=args.nfe_step,
+            seed=args.seed,
+            speed=args.speed,
+            qwen_profile=args.qwen_profile,
+            max_new_tokens=args.max_new_tokens,
+        )
         times = []
         for i in range(args.bench):
             r = generate(
@@ -234,6 +268,11 @@ def main():
                 nfe_step=args.nfe_step,
                 seed=args.seed,
                 speed=args.speed,
+                voice_preset=args.voice_preset,
+                voice_instruct=args.voice_instruct,
+                language=args.language,
+                qwen_profile=args.qwen_profile,
+                max_new_tokens=args.max_new_tokens,
                 out_path=Path(args.output) if args.output else None,
             )
             times.append(float(r["infer_ms"]))
@@ -256,6 +295,11 @@ def main():
         nfe_step=args.nfe_step,
         seed=args.seed,
         speed=args.speed,
+        voice_preset=args.voice_preset,
+        voice_instruct=args.voice_instruct,
+        language=args.language,
+        qwen_profile=args.qwen_profile,
+        max_new_tokens=args.max_new_tokens,
         out_path=Path(args.output) if args.output else None,
         play=args.play,
     )

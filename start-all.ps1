@@ -10,6 +10,8 @@ param(
     [string]$FaceRemoteUrl = "",
     [ValidateSet("cuda", "cpu")]
     [string]$Device = "cuda",
+    [ValidateSet("qwentts", "f5")]
+    [string]$TtsBackend = "qwentts",
     [switch]$Release,
     [switch]$NoFaceBrowser
 )
@@ -129,8 +131,8 @@ function Build-CondaLaunch {
     }
     if (Get-Command conda -ErrorAction SilentlyContinue) {
         return @{
-            CommandLine = ("conda run -n {0} --no-capture-output python {1}" -f $EnvName, $ScriptArgs)
-            Source = ("conda run:{0}" -f $EnvName)
+            CommandLine = ("conda run --live-stream -n {0} --no-capture-output python {1}" -f $EnvName, $ScriptArgs)
+            Source = ("conda run --live-stream:{0}" -f $EnvName)
         }
     }
     Write-Warn ("Conda env '{0}' not found. Falling back to PATH python." -f $EnvName)
@@ -172,14 +174,17 @@ if ($Remote) {
 }
 Write-Host "  Ports: Speaking 8765 | Gaze 8766 | Face 8000 | Audio 8010"
 Write-Host "  Envs : Speaking -> conda F5TTS | Gaze -> conda GAZE | Face -> conda FACE | Audio -> conda AUDIO"
+Write-Host ("  Speaking backend default: {0}" -f $TtsBackend)
 Write-Host ""
 
 if (-not $SkipSpeaking) {
     $wd = Join-Path $Root "VPet-Speaking\Local_model\Fast_generating"
+    $f5NfeStep = if ($env:VPET_F5_NFE_STEP) { $env:VPET_F5_NFE_STEP } else { "16" }
     $launch = Build-CondaLaunch -EnvName $CondaEnvF5 -OverridePath $env:VPET_F5_PYTHON `
-        -ScriptArgs ("start_server.py --device {0}" -f $Device)
+        -ScriptArgs ("start_server.py --tts_backend {0} --device {1} --nfe_step {2}" -f $TtsBackend, $Device, $f5NfeStep)
     Write-Ok ("Speaking env: {0}" -f $launch.Source)
-    Start-BackendWindow -Title "VPet-Speaking F5-TTS :8765" -WorkingDir $wd `
+    $speakingTitle = if ($TtsBackend -eq "qwentts") { "VPet-Speaking Qwen-TTS :8765" } else { "VPet-Speaking F5-TTS :8765" }
+    Start-BackendWindow -Title $speakingTitle -WorkingDir $wd `
         -CommandLine $launch.CommandLine | Out-Null
 } else {
     Write-Step "Skip Speaking"

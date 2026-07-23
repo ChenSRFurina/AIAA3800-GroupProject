@@ -116,10 +116,12 @@ RetinaFace 默认读本地 `face-detect-local/model/model.safetensors`；multita
 
 ```powershell
 cd audio
-conda create -n AUDIO python=3.13 -y
+conda create -n AUDIO python=3.11 -y
 conda activate AUDIO
 .\setup.bat
 # 使用当前 conda 环境的 python/pip 安装依赖；请确保根目录 .env 已填 DEEPSEEK_API_KEY
+# Windows 下 torch Whisper 后端会通过 cu130 源安装 torch；可用 VPET_TORCH_INDEX 覆盖
+# 默认使用 faster-whisper；可用 VPET_WHISPER_BACKEND=torch 切到 torch Whisper
 ```
 
 ---
@@ -164,14 +166,15 @@ cd VPet-Simulator.Windows
 
 ```powershell
 .\start-all.bat -GazeMock          # 无摄像头测 Gaze
-.\start-all.bat -Device cpu        # F5 用 CPU
+.\start-all.bat -Device cpu        # Speaking 用 CPU
+.\start-all.bat -TtsBackend f5     # 切回 F5-TTS
 .\start-all.bat -SkipAudio         # 跳过某后端
 .\start-all.bat -NoFrontend        # 只启后端
 ```
 
 环境约定（`start-all.ps1`）：
 
-- Speaking → conda `F5TTS`；Gaze → conda `GAZE`
+- Speaking（默认 `qwentts` 后端）→ conda `F5TTS`；Gaze → conda `GAZE`
 - FaceDetect（默认）→ `face-detect-local` + conda `FACE`
 - FaceDetect（`-Remote`）→ `face-detect-remote` relay，不跑本地推理
 - Audio → conda `AUDIO`
@@ -190,7 +193,7 @@ relay 仍监听本机 `127.0.0.1:8000`，VPet 与测试页无需改地址。
 # Speaking :8765
 conda activate F5TTS
 cd VPet-Speaking\Local_model\Fast_generating
-python start_server.py --device cuda
+python start_server.py --tts_backend qwentts --device cuda
 
 # Gaze :8766
 conda activate F5TTS
