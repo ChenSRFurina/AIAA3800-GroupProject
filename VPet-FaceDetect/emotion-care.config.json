@@ -1,0 +1,65 @@
+{
+  "emotionWindowSeconds": 4.0,
+  "emotionSummaryMaxElements": 5,
+  "latestMaxAgeSeconds": 5.0,
+  "globalCooldownSeconds": 6.0,
+  "defaultMinEmotionProbability": 0.14,
+  "scenes": {
+    "happy": {
+      "minScore": 0.12,
+      "burstThreshold": 0.42,
+      "burstMinDurationSeconds": 0.25,
+      "sustainedThreshold": 0.18,
+      "sustainedDurationSeconds": 0.90,
+      "legacyHoldSeconds": 0.80
+    },
+    "sad": {
+      "minScore": 0.12,
+      "burstThreshold": 0.40,
+      "burstMinDurationSeconds": 0.25,
+      "sustainedThreshold": 0.17,
+      "sustainedDurationSeconds": 0.85,
+      "legacyHoldSeconds": 0.75
+    },
+    "anger": {
+      "minScore": 0.10,
+      "burstThreshold": 0.36,
+      "burstMinDurationSeconds": 0.20,
+      "sustainedThreshold": 0.16,
+      "sustainedDurationSeconds": 0.75,
+      "legacyHoldSeconds": 0.65
+    },
+    "fear": {
+      "minScore": 0.10,
+      "burstThreshold": 0.35,
+      "burstMinDurationSeconds": 0.20,
+      "sustainedThreshold": 0.16,
+      "sustainedDurationSeconds": 0.75,
+      "legacyHoldSeconds": 0.65
+    },
+    "surprise": {
+      "minScore": 0.30,
+      "burstThreshold": 0.70,
+      "burstMinDurationSeconds": 0.5,
+      "sustainedThreshold": 0.30,
+      "sustainedDurationSeconds": 0.65,
+      "legacyHoldSeconds": 0.1
+    },
+    "disgust": {
+      "minScore": 0.11,
+      "burstThreshold": 0.36,
+      "burstMinDurationSeconds": 0.22,
+      "sustainedThreshold": 0.16,
+      "sustainedDurationSeconds": 0.80,
+      "legacyHoldSeconds": 0.70
+    },
+    "fatigue": {
+      "minScore": 0.40,
+      "burstThreshold": 0.78,
+      "burstMinDurationSeconds": 0.25,
+      "sustainedThreshold": 0.56,
+      "sustainedDurationSeconds": 1.30,
+      "legacyHoldSeconds": 1.80
+    }
+  }
+}

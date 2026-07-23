@@ -1,6 +1,7 @@
 import json
+import threading
 from typing import Any, Generator
-from learn_agent.llm import LLM
+from learn_agent.llm import GenerationCancelledError, LLM
 from learn_agent.memory import Memory
 from learn_agent.tool.toolkit import Toolkit
 
@@ -39,74 +40,100 @@ class Agent:
                 return toolkit.call(tool_name, **args)
         raise ValueError(f"Tool {tool_name} not found in any toolkit.")
 
-    def run(self, user_text: str) -> str:
+    def _ensure_not_cancelled(self, cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelledError("Agent run cancelled")
+
+    def run(self, user_text: str, cancel_event: threading.Event | None = None) -> str:
+        snapshot = self.memory.snapshot()
+
+        try:
+            self._ensure_not_cancelled(cancel_event)
         # 把用户输入加入上下文
-        self.memory.add_message(role="user", content=user_text)
+            self.memory.add_message(role="user", content=user_text)
 
-        tool_schema = self._all_tool_schemas()
+            tool_schema = self._all_tool_schemas()
 
-        for _round in range(self.max_tool_rounds):
-            # 每一轮都带上当前上下文让模型决定是否要调用工具
-            messages = self.memory.get_context()
+            for _round in range(self.max_tool_rounds):
+                self._ensure_not_cancelled(cancel_event)
+                messages = self.memory.get_context()
 
-            # 进行一次对话请求
-            msg = self.llm.chat(messages=messages, tools=tool_schema)
+                assistant_content_buffer = ""
+                tool_calls_info: list[dict] = []
 
-            # 处理模型返回的信息,其是assistant角色的消息
-            assistant_dict = {"role": "assistant"}
-            if getattr(msg, "content", None) is not None:
-                assistant_dict["content"] = msg.content
+                for event in self.llm.chat_stream(
+                    messages=messages,
+                    tools=tool_schema,
+                    cancel_event=cancel_event,
+                ):
+                    event_type = event.get("type")
+                    if event_type == "content":
+                        assistant_content_buffer += event["content"]
+                    elif event_type == "tool_calls":
+                        tool_calls_info = event["tool_calls"]
+                    elif event_type == "done":
+                        break
 
-            # 如果模型返回了工具调用信息，也要重新加入上下文，作为assistant消息的一部分
-            tool_calls = getattr(msg, "tool_calls", None)
-            if tool_calls:
-                assistant_dict["tool_calls"] = [tc.model_dump() for tc in tool_calls]
+                self._ensure_not_cancelled(cancel_event)
 
-            self.memory.add_message(**assistant_dict)
-
-            # 在此你可以添加反思 reflection 逻辑，决定是否继续调用工具
-            if not tool_calls:
-                # 没有调用工具，结束
-                return msg.content or ""
-
-            # 如果有工具调用，逐个执行，并把结果作为 role="tool" 回填到上下文
-            for tc in tool_calls:
-                # 解析模型返回的工具调用信息
-                tc_id = tc.id
-                fn_name = tc.function.name
-                raw_args = tc.function.arguments or "{}"
-
-                try:
-                    # arguments 可能是 JSON 字符串
-                    args = (
-                        json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    )
-                except Exception:
-                    args = {}
-
-                try:
-                    # 执行本地工具函数
-                    result = self._dispatch_tool(fn_name, args)
-                    # 工具结果以更“模型友好”的结构回填
-                    tool_content = json.dumps(
-                        {"ok": True, "result": result}, ensure_ascii=False
-                    )
-                except Exception as e:
-                    tool_content = json.dumps(
+                assistant_dict = {"role": "assistant"}
+                if assistant_content_buffer:
+                    assistant_dict["content"] = assistant_content_buffer
+                if tool_calls_info:
+                    assistant_dict["tool_calls"] = [
                         {
-                            "ok": False,
-                            "error": {"code": "TOOL_EXEC_ERROR", "message": str(e)},
-                        },
-                        ensure_ascii=False,
+                            "id": tc["id"],
+                            "type": tc.get("type", "function"),
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for tc in tool_calls_info
+                    ]
+
+                self.memory.add_message(**assistant_dict)
+
+                if not tool_calls_info:
+                    return assistant_content_buffer
+
+                for tc in tool_calls_info:
+                    self._ensure_not_cancelled(cancel_event)
+                    tc_id = tc["id"]
+                    fn_name = tc["function"]["name"]
+                    raw_args = tc["function"].get("arguments") or "{}"
+
+                    try:
+                        args = (
+                            json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        )
+                    except Exception:
+                        args = {}
+
+                    try:
+                        result = self._dispatch_tool(fn_name, args)
+                        tool_content = json.dumps(
+                            {"ok": True, "result": result}, ensure_ascii=False
+                        )
+                    except Exception as e:
+                        tool_content = json.dumps(
+                            {
+                                "ok": False,
+                                "error": {"code": "TOOL_EXEC_ERROR", "message": str(e)},
+                            },
+                            ensure_ascii=False,
+                        )
+
+                    self.memory.add_message(
+                        role="tool",
+                        content=tool_content,
+                        tool_call_id=tc_id,
                     )
 
-                self.memory.add_message(
-                    role="tool",
-                    content=tool_content,
-                    tool_call_id=tc_id,
-                )
-
-        return "ERROR: reached maximum tool rounds without a final answer."
+            return "ERROR: reached maximum tool rounds without a final answer."
+        except GenerationCancelledError:
+            self.memory.restore(snapshot)
+            raise
 
     def run_stream(
         self, user_text: str

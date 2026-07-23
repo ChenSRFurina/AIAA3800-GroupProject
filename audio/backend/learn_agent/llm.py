@@ -4,6 +4,11 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Generator
+import threading
+
+
+class GenerationCancelledError(Exception):
+    pass
 
 # 统一从 VPet/.env 加载（learn_agent -> backend -> audio -> VPet）
 _VPET_ROOT = Path(__file__).resolve().parents[3]
@@ -60,7 +65,10 @@ class LLM:
         return msg
 
     def chat_stream(
-        self, messages: list[dict], tools: list[dict] | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Generator[dict, None, None]:
         """
         流式对话方法，返回生成器
@@ -89,46 +97,60 @@ class LLM:
         content_buffer = ""
         tool_calls_buffer: dict[int, dict] = {}
 
-        for chunk in response:
-            delta = chunk.choices[0].delta
+        try:
+            for chunk in response:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelledError("LLM generation cancelled")
 
-            # 处理内容块
-            if delta.content:
-                content_chunk = delta.content
-                content_buffer += content_chunk
-                yield {"type": "content", "content": content_chunk}
+                delta = chunk.choices[0].delta
 
-            # 处理工具调用块
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    tc_index = tc.index
-                    if tc_index not in tool_calls_buffer:
-                        tool_calls_buffer[tc_index] = {
-                            "id": "",
-                            "type": "",
-                            "function": {"name": "", "arguments": ""},
-                        }
+                # 处理内容块
+                if delta.content:
+                    content_chunk = delta.content
+                    content_buffer += content_chunk
+                    yield {"type": "content", "content": content_chunk}
 
-                    if tc.id:
-                        tool_calls_buffer[tc_index]["id"] = tc.id
-                    if tc.type:
-                        tool_calls_buffer[tc_index]["type"] = tc.type
+                # 处理工具调用块
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        tc_index = tc.index
+                        if tc_index not in tool_calls_buffer:
+                            tool_calls_buffer[tc_index] = {
+                                "id": "",
+                                "type": "",
+                                "function": {"name": "", "arguments": ""},
+                            }
 
-                    if tc.function and tc.function.name:
-                        tool_calls_buffer[tc_index]["function"]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_calls_buffer[tc_index]["function"][
-                            "arguments"
-                        ] += tc.function.arguments
+                        if tc.id:
+                            tool_calls_buffer[tc_index]["id"] = tc.id
+                        if tc.type:
+                            tool_calls_buffer[tc_index]["type"] = tc.type
 
-        # 流结束，输出完整工具调用信息
-        if tool_calls_buffer:
-            tool_calls_list = [
-                tool_calls_buffer[i] for i in sorted(tool_calls_buffer.keys())
-            ]
-            yield {"type": "tool_calls", "tool_calls": tool_calls_list}
+                        if tc.function and tc.function.name:
+                            tool_calls_buffer[tc_index]["function"]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            tool_calls_buffer[tc_index]["function"][
+                                "arguments"
+                            ] += tc.function.arguments
 
-        yield {"type": "done"}
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelledError("LLM generation cancelled")
+
+            # 流结束，输出完整工具调用信息
+            if tool_calls_buffer:
+                tool_calls_list = [
+                    tool_calls_buffer[i] for i in sorted(tool_calls_buffer.keys())
+                ]
+                yield {"type": "tool_calls", "tool_calls": tool_calls_list}
+
+            yield {"type": "done"}
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 class DeepSeek(LLM):

@@ -137,6 +137,8 @@ class LayeredMemoryManager:
     }
 
     MAX_MEMORIES_PER_USER = 200
+    SHORT_WINDOW_SECONDS = 8 * 60
+    DAY_WINDOW_SECONDS = 24 * 3600
     _EXTRACT_RULES: List[tuple[str, MemoryImportance, List[str]]] = [
         ("pet", MemoryImportance.MEDIUM, ["猫", "狗", "宠物", "养了", "猫咪", "小狗"]),
         ("health", MemoryImportance.HIGH, ["生病", "住院", "手术", "不舒服", "医院", "感冒", "发烧"]),
@@ -255,6 +257,9 @@ class LayeredMemoryManager:
         importance: MemoryImportance,
         category: str,
         source_conversation_id: str = "",
+        *,
+        allow_merge: bool = True,
+        max_content_len: int = 1200,
     ) -> Optional[MemoryEntry]:
         """存储记忆；内容过短或重复则跳过 / 合并。"""
         content = (content or "").strip()
@@ -268,23 +273,24 @@ class LayeredMemoryManager:
 
             # 去重：同类别 + 高度相似内容 → 刷新访问，不重复写入
             normalized = self._normalize(content)
-            for existing in memories:
-                if existing.category != category:
-                    continue
-                if self._is_similar(self._normalize(existing.content), normalized):
-                    existing.last_accessed = time.time()
-                    existing.access_count += 1
-                    # 保留更高重要性
-                    if importance.value > existing.importance.value:
-                        existing.importance = importance
-                        existing.content = content[:400]
-                    if self.autosave:
-                        self._save_user(uid)
-                    return existing
+            if allow_merge:
+                for existing in memories:
+                    if existing.category != category:
+                        continue
+                    if self._is_similar(self._normalize(existing.content), normalized):
+                        existing.last_accessed = time.time()
+                        existing.access_count += 1
+                        # 保留更高重要性
+                        if importance.value > existing.importance.value:
+                            existing.importance = importance
+                            existing.content = content[:max_content_len]
+                        if self.autosave:
+                            self._save_user(uid)
+                        return existing
 
             now = time.time()
             entry = MemoryEntry(
-                content=content[:400],
+                content=content[:max_content_len],
                 importance=importance,
                 category=category,
                 created_at=now,
@@ -484,6 +490,9 @@ class LayeredMemoryManager:
         transcript: str,
         *,
         source_conversation_id: str = "voice-asr",
+        emotion_summary: str = "",
+        interruption_context: str = "",
+        interrupted_emotion: str = "",
     ) -> Optional[MemoryEntry]:
         """
         仅记录语音识别得到的用户原话（已格式化）。
@@ -493,21 +502,84 @@ class LayeredMemoryManager:
         if not text:
             return None
 
-        # 过滤过短语气词
-        fillers = {"嗯", "啊", "哦", "呃", "唔", "嗯嗯", "啊啊", "哦哦", "哈", "呵"}
-        if text in fillers:
-            return None
-        if len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text)) < 2:
-            return None
+        leak_markers = (
+            "语音准确转写为简体中文文本",
+            "请将语音准确转写为简体中文文本",
+            "transcribe speech accurately in english text",
+        )
+        normalized_text = self._normalize(text)
+        for marker in leak_markers:
+            normalized_marker = self._normalize(marker)
+            if normalized_text == normalized_marker:
+                return None
 
         category, importance = self._classify_utterance(text)
-        # 统一格式：带日期，便于 prompt / JSON 按时间阅读
-        content = f"[{_ts_date(time.time())}] 用户说：{text}"
+        # 统一格式：带日期，附带情绪摘要（若有）
+        parts = [f"[{_ts_date(time.time())}] 用户说：{text}"]
+        if interrupted_emotion:
+            parts.append(f"interrupted_emotion={interrupted_emotion[:32]}")
+        if emotion_summary:
+            parts.append(f"emotion={emotion_summary[:240]}")
+        if interruption_context:
+            parts.append(f"interrupt_ctx={interruption_context[:240]}")
+        content = "；".join(parts)
         return self.store(
             user_id,
             content,
             importance,
             category,
+            source_conversation_id=source_conversation_id,
+            allow_merge=False,
+            max_content_len=2400,
+        )
+
+    def remember_agent_reply(
+        self,
+        user_id: str,
+        reply: str,
+        *,
+        source_conversation_id: str = "agent-reply",
+        category: str = "assistant",
+        importance: MemoryImportance = MemoryImportance.LOW,
+    ) -> Optional[MemoryEntry]:
+        """记录助手回复（短期为主，便于上下文连贯）。"""
+        text = self.normalize_voice_transcript(reply)
+        if not text:
+            return None
+        content = f"[{_ts_date(time.time())}] 助手说：{text}"
+        return self.store(
+            user_id,
+            content,
+            importance,
+            category,
+            source_conversation_id=source_conversation_id,
+            allow_merge=False,
+        )
+
+    def remember_emotion_event(
+        self,
+        user_id: str,
+        *,
+        scene: str,
+        hint: str = "",
+        emotion_window: str = "",
+        source_conversation_id: str = "emotion-care",
+    ) -> Optional[MemoryEntry]:
+        """记录情绪触发事件（用于后续对话对齐用户状态）。"""
+        sc = (scene or "").strip().lower()
+        if not sc:
+            return None
+        parts = [f"[{_ts_date(time.time())}] 情绪事件：{sc}"]
+        if hint:
+            parts.append(f"hint={hint[:90]}")
+        if emotion_window:
+            parts.append(f"window={emotion_window[:180]}")
+        content = "；".join(parts)
+        return self.store(
+            user_id,
+            content,
+            MemoryImportance.MEDIUM,
+            "emotion",
             source_conversation_id=source_conversation_id,
         )
 
@@ -527,10 +599,76 @@ class LayeredMemoryManager:
             return dict(self._user_profiles.get(uid, {}))
 
     def format_for_prompt(self, user_id: str, topic: str = "", limit: int = 5) -> str:
-        memories = self.retrieve(user_id, current_topic=topic, limit=limit)
-        if not memories:
+        buckets = self.retrieve_time_buckets(user_id, current_topic=topic, limit=limit)
+        if not buckets["recent"] and not buckets["today"] and not buckets["history"]:
             return "暂无历史信息"
-        return "\n".join(_format_memory_line(m) for m in memories)
+
+        lines: List[str] = []
+        if buckets["recent"]:
+            lines.append("【近几分钟】")
+            lines.extend(_format_memory_line(m) for m in buckets["recent"])
+        if buckets["today"]:
+            lines.append("【今天更早】")
+            lines.extend(_format_memory_line(m) for m in buckets["today"])
+        if buckets["history"]:
+            lines.append("【更早历史】")
+            lines.extend(_format_memory_line(m) for m in buckets["history"])
+        return "\n".join(lines)
+
+    def retrieve_time_buckets(
+        self,
+        user_id: str,
+        current_topic: str = "",
+        limit: int = 12,
+    ) -> Dict[str, List[MemoryEntry]]:
+        """按时间分桶检索：近几分钟 / 今天 / 更早。"""
+        uid = self._safe_user_id(user_id)
+        with self._lock:
+            self._ensure_loaded(uid)
+            all_memories = list(self._memories.get(uid, []))
+            if not all_memories:
+                return {"recent": [], "today": [], "history": []}
+
+            now = time.time()
+            recent: List[MemoryEntry] = []
+            today: List[MemoryEntry] = []
+            history: List[MemoryEntry] = []
+
+            for m in all_memories:
+                age = max(0.0, now - m.created_at)
+                if age <= self.SHORT_WINDOW_SECONDS:
+                    recent.append(m)
+                elif age <= self.DAY_WINDOW_SECONDS:
+                    today.append(m)
+                else:
+                    history.append(m)
+
+            def _top(items: List[MemoryEntry], n: int) -> List[MemoryEntry]:
+                ranked = sorted(items, key=lambda x: self._compute_score(x, current_topic), reverse=True)
+                return ranked[:n]
+
+            rec_n = max(1, min(limit // 3, 5))
+            day_n = max(1, min(limit // 3, 5))
+            hist_n = max(1, limit - rec_n - day_n)
+
+            picked_recent = _top(recent, rec_n)
+            picked_today = _top(today, day_n)
+            picked_history = _top(history, hist_n)
+
+            touched = picked_recent + picked_today + picked_history
+            if touched:
+                ts = time.time()
+                for m in touched:
+                    m.last_accessed = ts
+                    m.access_count += 1
+                if self.autosave:
+                    self._save_user(uid)
+
+            return {
+                "recent": picked_recent,
+                "today": picked_today,
+                "history": picked_history,
+            }
 
     def list_users(self) -> List[str]:
         users = {p.stem for p in self.storage_dir.glob("*.json") if p.name != "profiles.json"}

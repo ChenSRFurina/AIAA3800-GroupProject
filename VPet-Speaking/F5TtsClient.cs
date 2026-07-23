@@ -106,7 +106,7 @@ namespace VPet.Plugin.Speaking
 
                     return wav;
                 }
-                catch (Exception ex) when (attempt == 0 && ex is IOException or SocketException or ObjectDisposedException)
+                catch (Exception ex) when (attempt == 0 && ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
                 {
                     Console.WriteLine($"[VPet-Speaking] F5 连接中断，重连重试: {ex.Message}");
                     DropConnection();
@@ -163,7 +163,11 @@ namespace VPet.Plugin.Speaking
             }
 
             _client = client;
+            _client.ReceiveTimeout = _timeoutMs;
+            _client.SendTimeout = _timeoutMs;
             _stream = client.GetStream();
+            _stream.ReadTimeout = _timeoutMs;
+            _stream.WriteTimeout = _timeoutMs;
             Console.WriteLine($"[VPet-Speaking] F5 长连接已建立 {_host}:{_port}");
         }
 

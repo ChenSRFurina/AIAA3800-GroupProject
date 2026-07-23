@@ -117,27 +117,13 @@ def _on_voice_response(text: str) -> None:
 
 
 def _on_voice_transcript(text: str) -> None:
-    """语音转写回调 — 仅此处写入长期记忆（用户原话）。"""
+    """语音转写回调 — 仅入队，记忆以 Speaking 实际播报链路回写为准。"""
     cleaned = (text or "").strip()
     voice_messages.append({
         "type": "user_message",
         "content": cleaned,
         "source": "voice",
     })
-
-    if memory_manager is None or not cleaned:
-        return
-    entry = memory_manager.remember_voice_utterance(
-        DEFAULT_MEMORY_USER,
-        cleaned,
-        source_conversation_id="voice-asr",
-    )
-    if entry:
-        print(
-            f"[Memory] 语音用户话已记录: [{entry.category}/{entry.importance.name}] "
-            f"{entry.content}"
-        )
-        _refresh_system_prompt(cleaned)
 
 
 @asynccontextmanager
@@ -174,13 +160,13 @@ async def lifespan(app: FastAPI):
     )
     _refresh_system_prompt()
 
-    # 包装 run / run_stream：只注入已有记忆到 prompt；落盘仅语音转写回调
+    # 包装 run / run_stream：对话前注入长期记忆到 prompt；写入点由各业务入口显式控制
     _orig_run = agent_instance.run
     _orig_stream = agent_instance.run_stream
 
-    def _run_with_memory(user_text: str) -> str:
+    def _run_with_memory(user_text: str, cancel_event=None) -> str:
         _after_user_turn(user_text)
-        return _orig_run(user_text)
+        return _orig_run(user_text, cancel_event=cancel_event)
 
     def _stream_with_memory(user_text: str):
         _after_user_turn(user_text)
@@ -312,6 +298,15 @@ async def chat_reply(request: Request):
         # agent.run 为同步阻塞调用，放到线程池避免卡住事件循环
         reply = await asyncio.to_thread(agent_instance.run, user_input)
         reply_text = (reply or "").strip()
+
+        if memory_manager is not None and reply_text:
+            memory_manager.remember_agent_reply(
+                DEFAULT_MEMORY_USER,
+                reply_text,
+                source_conversation_id="chat-reply",
+                category="assistant",
+            )
+
         return {
             "ok": True,
             "message": user_input,
@@ -325,14 +320,24 @@ async def chat_reply(request: Request):
 async def chat_care(request: Request):
     """
     桌宠情绪陪伴（供 VPet-FaceDetect）：
-    不走工具 Agent、不写长期记忆；可注入已有语音记忆上下文。
+    不走工具 Agent；是否入长期记忆由 Speaking 的实际播报结果决定。
 
-    请求体: {"scene":"happy|sad|surprise|fear|disgust|anger|fatigue", "hint":"..."}
+        请求体:
+        {
+            "scene":"happy|sad|surprise|fear|disgust|anger|fatigue",
+            "hint":"...",
+            "emotion_window":"...",
+            "interruption_context":"...",
+            "recent_user_speech":"..."
+        }
     响应: {"ok": true, "scene": "...", "reply": "..."}
     """
     body = await request.json()
     scene = (body.get("scene") or "").strip().lower()
     hint = (body.get("hint") or "").strip()
+    emotion_window = (body.get("emotion_window") or "").strip()
+    interruption_context = (body.get("interruption_context") or "").strip()
+    recent_user_speech = (body.get("recent_user_speech") or "").strip()
 
     if scene not in SCENE_USER_PROMPTS:
         return {
@@ -349,19 +354,26 @@ async def chat_care(request: Request):
     memory_text = ""
     if memory_manager is not None:
         try:
+            topic_for_memory = (
+                (recent_user_speech or "").strip()
+                or (interruption_context or "").strip()
+                or (hint or "").strip()
+                or scene
+            )
             memory_text = memory_manager.format_for_prompt(
                 DEFAULT_MEMORY_USER,
-                topic=hint or scene,
+                topic=topic_for_memory,
                 limit=5,
             )
         except Exception as mem_exc:
             print(f"[Memory] care context skip: {mem_exc}")
 
     if agent_instance is None or agent_instance.llm is None:
+        fallback = _fallback()
         return {
             "ok": True,
             "scene": scene,
-            "reply": _fallback(),
+            "reply": fallback,
             "fallback": True,
             "error": "Agent 未初始化，已用本地台词",
             "memory_used": bool(memory_text and memory_text != "暂无历史信息"),
@@ -372,6 +384,9 @@ async def chat_care(request: Request):
             scene,
             hint=hint,
             memory_text=memory_text,
+            emotion_window=emotion_window,
+            interruption_context=interruption_context,
+            recent_user_speech=recent_user_speech,
         )
 
         def _call() -> str:
@@ -380,7 +395,7 @@ async def chat_care(request: Request):
             old_temp = getattr(llm, "temperature", None)
             try:
                 llm.max_tokens = 64
-                llm.temperature = 0.6
+                llm.temperature = 0.35
                 msg = llm.chat(messages=messages, tools=None)
             finally:
                 llm.max_tokens = old_max
@@ -408,13 +423,82 @@ async def chat_care(request: Request):
             "memory_used": mem_used,
         }
     except Exception as exc:
+        fallback = _fallback()
         return {
             "ok": True,
             "scene": scene,
-            "reply": _fallback(),
+            "reply": fallback,
             "fallback": True,
             "error": str(exc),
         }
+
+
+@app.post("/memory/voice-event")
+async def memory_voice_event(request: Request):
+    """
+    由 Speaking 回写“实际发生”的语音事件，保证 memory 与播报一致。
+
+    请求体:
+    {
+      "event_type": "user|assistant",
+      "text": "...",
+      "source": "voice-asr|voice-assistant|emotion-care",
+      "category": "assistant|care",
+      "scene": "happy",
+      "emotion_summary": "...",
+      "interruption_context": "...",
+      "interrupted_emotion": "...",
+      "interrupted": false
+    }
+    """
+    if memory_manager is None:
+        return {"ok": False, "error": "memory manager unavailable"}
+
+    body = await request.json()
+    event_type = (body.get("event_type") or "").strip().lower()
+    text = (body.get("text") or "").strip()
+    source = (body.get("source") or "voice").strip()
+    category = (body.get("category") or "assistant").strip()
+    scene = (body.get("scene") or "").strip().lower()
+    emotion_summary = (body.get("emotion_summary") or "").strip()
+    interruption_context = (body.get("interruption_context") or "").strip()
+    interrupted_emotion = (body.get("interrupted_emotion") or "").strip().lower()
+    interrupted = bool(body.get("interrupted", False))
+
+    if not text:
+        return {"ok": False, "error": "text empty"}
+
+    if event_type == "user":
+        entry = memory_manager.remember_voice_utterance(
+            DEFAULT_MEMORY_USER,
+            text,
+            source_conversation_id=source,
+            emotion_summary=emotion_summary,
+            interruption_context=interruption_context,
+            interrupted_emotion=interrupted_emotion,
+        )
+        if entry:
+            _refresh_system_prompt(text)
+        return {"ok": True, "stored": bool(entry)}
+
+    if event_type == "assistant":
+        # 被打断的情绪播报不入库
+        if interrupted and (category == "care" or source.startswith("emotion-care")):
+            return {"ok": True, "stored": False, "skipped": "interrupted_emotion_care"}
+
+        payload = text
+        if scene:
+            payload = f"[{scene}] {payload}"
+
+        entry = memory_manager.remember_agent_reply(
+            DEFAULT_MEMORY_USER,
+            payload,
+            source_conversation_id=source,
+            category=category,
+        )
+        return {"ok": True, "stored": bool(entry)}
+
+    return {"ok": False, "error": "event_type must be user|assistant"}
 
 
 # ── 语音相关接口 ────────────────────────────────────────────────────────

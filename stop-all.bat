@@ -25,12 +25,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  }" ^
   "};" ^
   "$procList = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue;" ^
-  "$procList | Where-Object {" ^
-  "  ($_.Name -ieq 'python.exe' -or $_.Name -ieq 'pythonw.exe' -or $_.Name -ieq 'cmd.exe' -or $_.Name -ieq 'powershell.exe') -and" ^
-  "  ($pyMarkers | Where-Object { $_ -and $_.Length -gt 0 -and $_.ToLower() -in ($_.CommandLine.ToLower()) })" ^
-  "} | ForEach-Object {" ^
-  "  Write-Host ('  stop proc: pid=' + $_.ProcessId + ' name=' + $_.Name);" ^
-  "  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue;" ^
+  "$procList | ForEach-Object {" ^
+  "  $p = $_;" ^
+  "  $isRunner = ($p.Name -ieq 'python.exe' -or $p.Name -ieq 'pythonw.exe' -or $p.Name -ieq 'cmd.exe' -or $p.Name -ieq 'powershell.exe');" ^
+  "  if (-not $isRunner) { return };" ^
+  "  $cmd = (($p.CommandLine + '')).ToLower();" ^
+  "  foreach ($m in $pyMarkers) {" ^
+  "    if ($m -and $cmd.Contains($m.ToLower())) {" ^
+  "      Write-Host ('  stop proc: pid=' + $p.ProcessId + ' name=' + $p.Name);" ^
+  "      Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue;" ^
+  "      break;" ^
+  "    }" ^
+  "  }" ^
   "};" ^
   "Get-Process 'VPet-Simulator.Windows' -ErrorAction SilentlyContinue | ForEach-Object {" ^
   "  Write-Host ('  stop frontend PID ' + $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue" ^

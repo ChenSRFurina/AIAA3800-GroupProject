@@ -6,21 +6,21 @@
 流程:  麦克风录音 → WAV 音频 → Whisper 离线语音转文本 → Qwen 量化模型 → 文字回复
 """
 
-import io
-import importlib
 import os
-import sys
-import wave
 import time
-import json
 import atexit
 import threading
-import tempfile
-import ctypes
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+from transcript_utils import collapse_repetitive_transcript
+from wav_utils import merge_wav_chunks, numpy_to_wav
+from whisper_stt_base import BaseWhisperSTT
+from whisper_stt_factory import create_whisper_stt
+from whisper_stt_faster import faster_whisper_available
+from whisper_stt_torch import transformers_whisper_available
 
 # ── 可选依赖 (运行时按需加载) ──────────────────────────────────────────
 _SOUNDDEVICE_AVAILABLE = True
@@ -30,21 +30,10 @@ except ImportError:
     _SOUNDDEVICE_AVAILABLE = False
     sd = None
 
-_FASTER_WHISPER_AVAILABLE = True
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    _FASTER_WHISPER_AVAILABLE = False
-    WhisperModel = None
+_FASTER_WHISPER_AVAILABLE = faster_whisper_available()
+_TRANSFORMERS_AVAILABLE = transformers_whisper_available()
 
-_TRANSFORMERS_AVAILABLE = True
-try:
-    import torch
-    from transformers import pipeline
-except ImportError:
-    _TRANSFORMERS_AVAILABLE = False
-    torch = None
-    pipeline = None
+from learn_agent.llm import GenerationCancelledError
 
 _LLAMA_CPP_AVAILABLE = True
 try:
@@ -52,79 +41,6 @@ try:
 except ImportError:
     _LLAMA_CPP_AVAILABLE = False
     Llama = None
-
-
-def _whisper_cuda_available() -> bool:
-    """Best-effort CUDA probe for faster-whisper runtime (CTranslate2 first)."""
-    if os.name == "nt":
-        missing = _missing_windows_cuda_runtime_dlls()
-        if missing:
-            print(f"[WhisperSTT] 缺少 CUDA 运行时 DLL，改用 CPU: {', '.join(missing)}")
-            return False
-
-    try:
-        ct2 = importlib.import_module("ctranslate2")
-        return int(ct2.get_cuda_device_count()) > 0
-    except Exception:
-        pass
-
-    # fallback: torch isn't required by faster-whisper, but can still hint CUDA presence
-    try:
-        torch_mod = importlib.import_module("torch")
-        return bool(torch_mod.cuda.is_available())
-    except Exception:
-        return False
-
-
-def _missing_windows_cuda_runtime_dlls() -> list[str]:
-    if os.name != "nt":
-        return []
-
-    required = [
-        "cublas64_12.dll",
-        "cublasLt64_12.dll",
-    ]
-    missing: list[str] = []
-    for dll_name in required:
-        try:
-            ctypes.WinDLL(dll_name)
-        except OSError:
-            missing.append(dll_name)
-    return missing
-
-
-def _is_whisper_cuda_runtime_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    markers = (
-        "cublas64_12.dll",
-        "cublaslt64_12.dll",
-        "cudnn",
-        "cuda",
-        "cannot be loaded",
-        "not found",
-        "failed to create cublas handle",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _torch_cuda_available() -> bool:
-    try:
-        return bool(torch is not None and torch.cuda.is_available())
-    except Exception:
-        return False
-
-
-def _torch_whisper_model_id(name: str) -> str:
-    alias = {
-        "tiny": "openai/whisper-tiny",
-        "base": "openai/whisper-base",
-        "small": "openai/whisper-small",
-        "medium": "openai/whisper-medium",
-        "large": "openai/whisper-large-v3-turbo",
-        "large-v3": "openai/whisper-large-v3",
-        "large-v3-turbo": "openai/whisper-large-v3-turbo",
-    }
-    return alias.get((name or "base").strip().lower(), name)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -139,14 +55,23 @@ class VoiceConfig:
     channels: int = 1                 # 单声道
     chunk_duration: float = 0.3       # 每个音频块时长 (秒)
     silence_threshold: float = 0.015  # 静音 RMS 阈值 (0~1)
-    silence_sec: float = 1.5          # 连续静音多少秒后停止录音
+    silence_sec: float = 0.6          # 连续静音多少秒后停止录音
     max_record_sec: float = 30.0      # 单次录音最长时长
+    reply_settle_sec: float = 0.3    # 停顿后短暂等待，随后立即开始转写/回复
 
     # ── Whisper ──
-    whisper_model: str = "base"       # tiny / base / small / medium / large
-    whisper_backend: str = "faster"   # faster | torch | auto
+    whisper_model: str = "small"       # tiny / base / small / medium / large
+    whisper_backend: str = "torch"   # faster | torch | auto
     whisper_device: str = "auto"      # auto | cpu | cuda
     whisper_compute: str = "auto"     # auto | int8 (CPU) | float16 (GPU)
+    whisper_allowed_languages: str = "zh,en"  # 仅允许识别这些语种（逗号分隔）
+    whisper_language_mode: str = "whitelist"  # whitelist | force
+    whisper_force_language: str = ""           # force 模式下使用，留空则按 allowed 第一项
+    whisper_preferred_language: str = "zh"    # 白名单模式下默认更偏向中文
+    whisper_use_initial_prompt: bool = True     # faster-whisper 使用 initial_prompt（比 prompt_ids 更稳）
+    whisper_use_prompt_ids: bool = False        # 不使用 prompt_ids，统一使用 initial_prompt
+    whisper_initial_prompt: str = "请准确转写语音内容，内容可能为中文、英文或中英混杂。"
+    whisper_hf_mirror: str = "https://hf-mirror.com"  # torch Whisper 下载镜像
 
     # ── Qwen GGUF ──
     qwen_model_path: str = ""          # Qwen GGUF 文件路径 (留空则使用 Agent)
@@ -254,240 +179,18 @@ class AudioRecorder:
         if not started_speaking or len(frames) < 3:
             return None
 
-        audio = np.concatenate(pre_buffer + frames, axis=0)
-        return _numpy_to_wav(audio, self.cfg.sample_rate, self.cfg.channels)
+        audio = np.concatenate(frames, axis=0)
+        return numpy_to_wav(audio, self.cfg.sample_rate, self.cfg.channels)
 
-
-def _numpy_to_wav(audio: np.ndarray, sr: int, channels: int) -> bytes:
-    """将 float32 numpy 数组转为 16-bit PCM WAV 字节。"""
-    buf = io.BytesIO()
-    audio_i16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(audio_i16.tobytes())
-    buf.seek(0)
-    return buf.read()
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                    ◆  语 音 转 文 字  (Whisper)  ◆                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-def _get_models_dir() -> str:
-    """获取模型存储目录 (项目内的 models/ 文件夹，可随项目复制)。"""
-    # 优先使用项目内的 models 目录
-    audio_file = Path(__file__).resolve()
-    project_models = audio_file.parent.parent / "models"  # backend/../models
-    project_models.mkdir(parents=True, exist_ok=True)
-    return str(project_models)
-
-
-class WhisperSTT:
-    """本地离线语音转文字，支持 faster-whisper 与 torch/transformers 两种后端。"""
-
-    _MODEL_FILES = [
-        "config.json",
-        "model.bin",
-        "tokenizer.json",
-        "vocabulary.txt",
-    ]
-    _MODEL_REPO = "Systran/faster-whisper-base"
-    _MIRROR_BASE = "https://hf-mirror.com"
-
-    def __init__(self, config: VoiceConfig):
-        self.cfg = config
-        self._model = None
-        self._backend = ""
-
-    def _resolve_backend(self) -> str:
-        backend = (os.getenv("VPET_WHISPER_BACKEND") or self.cfg.whisper_backend or "faster").strip().lower()
-        if backend not in ("", "auto", "faster", "torch"):
-            raise ValueError(f"不支持的 Whisper backend: {backend}")
-        if backend in ("", "auto"):
-            if _TRANSFORMERS_AVAILABLE:
-                return "torch"
-            return "faster"
-        return backend
-
-    def _build_model(self, model_path: str, device: str, compute: str) -> WhisperModel:
-        return WhisperModel(model_path, device=device, compute_type=compute)
-
-    def _fallback_to_cpu(self, model_path: str, reason: Exception) -> None:
-        print(f"[WhisperSTT] CUDA 不可用，回退 CPU: {reason}")
-        self.cfg.whisper_device = "cpu"
-        self.cfg.whisper_compute = "int8"
-        self.cfg.whisper_backend = "faster"
-        self._model = self._build_model(model_path, "cpu", "int8")
-
-    def _download_model(self) -> str:
-        """从 HF 镜像直接下载 faster-whisper 模型文件。"""
-        import httpx
-
-        cache_dir = self.cfg.model_cache_dir or _get_models_dir()
-        model_dir = os.path.join(cache_dir, "faster-whisper-base")
-        os.makedirs(model_dir, exist_ok=True)
-
-        all_exist = all(os.path.exists(os.path.join(model_dir, f)) for f in self._MODEL_FILES)
-        if all_exist:
-            print(f"[WhisperSTT] 模型已存在: {model_dir}")
-            return model_dir
-
-        print(f"[WhisperSTT] 下载模型文件到 {model_dir} …")
-        for filename in self._MODEL_FILES:
-            url = f"{self._MIRROR_BASE}/{self._MODEL_REPO}/resolve/main/{filename}"
-            dest = os.path.join(model_dir, filename)
-
-            if os.path.exists(dest):
-                size = os.path.getsize(dest)
-                if filename == "model.bin" and size > 100_000_000:
-                    print(f"  [跳过] {filename} ({size / 1024 / 1024:.0f} MB)")
-                    continue
-                if filename != "model.bin":
-                    print(f"  [跳过] {filename}")
-                    continue
-
-            print(f"  [下载] {filename} …")
-            try:
-                with httpx.stream("GET", url, follow_redirects=True, timeout=600) as resp:
-                    resp.raise_for_status()
-                    total = int(resp.headers.get("content-length", 0))
-                    downloaded = 0
-                    with open(dest, "wb") as file_obj:
-                        for chunk in resp.iter_bytes(chunk_size=8192):
-                            file_obj.write(chunk)
-                            downloaded += len(chunk)
-                            if total > 0 and downloaded % (total // 20 + 1) < 8192:
-                                pct = downloaded * 100 // total
-                                print(f"    {pct}% ({downloaded / 1024 / 1024:.0f}/{total / 1024 / 1024:.0f} MB)", end="\r")
-                    print(f"    100% ({downloaded / 1024 / 1024:.0f} MB) ✓")
-            except Exception as exc:
-                print(f"  [失败] {filename}: {exc}")
-                raise
-
-        print(f"[WhisperSTT] 模型下载完成: {model_dir}")
-        return model_dir
-
-    def _load_faster(self) -> None:
-        if not _FASTER_WHISPER_AVAILABLE:
-            raise ImportError("请安装 faster-whisper: pip install faster-whisper")
-
-        device = (os.getenv("VPET_WHISPER_DEVICE") or self.cfg.whisper_device or "auto").strip().lower()
-        compute = (os.getenv("VPET_WHISPER_COMPUTE") or self.cfg.whisper_compute or "auto").strip().lower()
-
-        has_cuda = _whisper_cuda_available()
-        if device in ("", "auto"):
-            device = "cuda" if has_cuda else "cpu"
-        if device.startswith("cuda") and not has_cuda:
-            print("[WhisperSTT] 检测到未启用 CUDA，自动回退到 CPU")
-            device = "cpu"
-
-        if compute in ("", "auto"):
-            compute = "float16" if device.startswith("cuda") else "int8"
-
-        model_path = self._download_model()
-        print(f"[WhisperSTT] 加载 faster-whisper '{self.cfg.whisper_model}' ({device}/{compute}) …")
+    def try_record_followup(self, max_record_sec: float | None = None) -> Optional[bytes]:
+        """在回复前短暂补听：若用户继续说，则并入同一轮输入。"""
+        original_max = self.cfg.max_record_sec
         try:
-            self._model = self._build_model(model_path, device, compute)
-        except Exception as exc:
-            if device.startswith("cuda"):
-                self._fallback_to_cpu(model_path, exc)
-                device = "cpu"
-                compute = "int8"
-            else:
-                raise
-
-        self.cfg.whisper_device = device
-        self.cfg.whisper_compute = compute
-        self.cfg.whisper_backend = "faster"
-
-    def _load_torch(self) -> None:
-        if not _TRANSFORMERS_AVAILABLE:
-            raise ImportError("请安装 transformers 和 torch 以使用 torch Whisper 后端")
-
-        device = (os.getenv("VPET_WHISPER_DEVICE") or self.cfg.whisper_device or "auto").strip().lower()
-        compute = (os.getenv("VPET_WHISPER_COMPUTE") or self.cfg.whisper_compute or "auto").strip().lower()
-
-        has_cuda = _torch_cuda_available()
-        if device in ("", "auto"):
-            device = "cuda" if has_cuda else "cpu"
-        if device.startswith("cuda") and not has_cuda:
-            print("[WhisperSTT] torch CUDA 不可用，自动回退到 CPU")
-            device = "cpu"
-
-        if compute in ("", "auto", "int8"):
-            compute = "float16" if device.startswith("cuda") else "float32"
-
-        model_id = _torch_whisper_model_id(self.cfg.whisper_model)
-        dtype = torch.float16 if compute == "float16" and device.startswith("cuda") else torch.float32
-        pipe_device = 0 if device.startswith("cuda") else "cpu"
-
-        print(f"[WhisperSTT] 加载 torch Whisper '{model_id}' ({device}/{compute}) …")
-        self._model = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            device=pipe_device,
-            torch_dtype=dtype,
-        )
-        self.cfg.whisper_device = device
-        self.cfg.whisper_compute = compute
-        self.cfg.whisper_backend = "torch"
-
-    def _load(self) -> None:
-        if self._model is not None:
-            return
-
-        self._backend = self._resolve_backend()
-        if self._backend == "torch":
-            self._load_torch()
-        else:
-            self._load_faster()
-        print("[WhisperSTT] 模型就绪 ✓")
-
-    def transcribe(self, wav_bytes: bytes) -> str:
-        """将 WAV 字节转写为中文文本。"""
-        self._load()
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        try:
-            tmp.write(wav_bytes)
-            tmp.close()
-
-            if self._backend == "torch":
-                result = self._model(
-                    tmp.name,
-                    generate_kwargs={"task": "transcribe", "language": "zh"},
-                    return_timestamps=False,
-                )
-                return (result.get("text") or "").strip()
-
-            try:
-                segments, _info = self._model.transcribe(
-                    tmp.name,
-                    language="zh",
-                    vad_filter=True,
-                    beam_size=5,
-                )
-            except Exception as exc:
-                if self.cfg.whisper_device.startswith("cuda") and _is_whisper_cuda_runtime_error(exc):
-                    model_path = self._download_model()
-                    self._fallback_to_cpu(model_path, exc)
-                    segments, _info = self._model.transcribe(
-                        tmp.name,
-                        language="zh",
-                        vad_filter=True,
-                        beam_size=5,
-                    )
-                else:
-                    raise
-
-            return " ".join(seg.text.strip() for seg in segments)
+            if max_record_sec is not None:
+                self.cfg.max_record_sec = max_record_sec
+            return self.record()
         finally:
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+            self.cfg.max_record_sec = original_max
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -584,10 +287,18 @@ class VoiceAssistant:
         self.voice_mode: bool = True    # 默认开启语音回复
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+        self._reply_thread: Optional[threading.Thread] = None
+        self._pending_audio: deque[bytes] = deque()
+        self._pending_deadline: float = 0.0
+        self._pending_version: int = 0
+        self._pending_lock = threading.Lock()
+        self._reply_wakeup = threading.Event()
+        self._active_stt_cancel_event: threading.Event | None = None
+        self._active_cancel_event: threading.Event | None = None
 
         # 组件 (延迟加载)
         self.recorder: Optional[AudioRecorder] = None
-        self.stt: Optional[WhisperSTT] = None
+        self.stt: Optional[BaseWhisperSTT] = None
         self.llm: Optional[QwenLLM] = None
         self.agent = None  # 外部 Agent 引用 (当 use_agent=True 时设置)
 
@@ -602,13 +313,15 @@ class VoiceAssistant:
 
         # 初始化组件
         self.recorder = AudioRecorder(self.cfg)
-        self.stt = WhisperSTT(self.cfg)
+        self.stt = create_whisper_stt(self.cfg)
         if not self._use_agent:
             self.llm = QwenLLM(self.cfg)
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="voice-thread")
+        self._reply_thread = threading.Thread(target=self._reply_loop, daemon=True, name="voice-reply-thread")
         self._thread.start()
+        self._reply_thread.start()
         print("[VoiceAssistant] Started - listening in background...")
         print(f"  Say '{self.WAKE_ON}' to enable voice replies")
         print(f"  Say '{self.WAKE_OFF}' to disable voice replies")
@@ -616,8 +329,11 @@ class VoiceAssistant:
     def stop(self) -> None:
         """停止后台监听线程。"""
         self._running = False
+        self._reply_wakeup.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
+        if self._reply_thread and self._reply_thread.is_alive():
+            self._reply_thread.join(timeout=3.0)
         print("[VoiceAssistant] Stopped")
 
     # ── 主循环 ──────────────────────────────────────────────────────────
@@ -628,54 +344,180 @@ class VoiceAssistant:
                 wav = self.recorder.record()
                 if wav is None:
                     continue
-
-                text = self.stt.transcribe(wav)
-                if not text:
-                    continue
-
-                print(f"[VoiceAssistant] Heard: '{text}'")
-
-                if self._on_transcript:
-                    self._on_transcript(text)
-
-                # ── 检测开关指令 ──
-                if self.WAKE_OFF in text:
-                    self.voice_mode = False
-                    print("[VoiceAssistant] Voice mode -> OFF")
-                    self._emit("语音功能已关闭")
-                    continue
-
-                if self.WAKE_ON in text:
-                    self.voice_mode = True
-                    print("[VoiceAssistant] Voice mode -> ON")
-                    self._emit("语音功能已开启！我在听~")
-                    continue
-
-                # ── 语音模式下处理用户语音 ──
-                if self.voice_mode:
-                    reply = self._generate_reply(text)
-                    if reply:
-                        print(f"[VoiceAssistant] Reply: '{reply}'")
-                        self._emit(reply)
+                self._queue_pending_audio(wav)
 
             except Exception as exc:
                 print(f"[VoiceAssistant] Error: {exc}")
                 time.sleep(0.5)
 
+    def _reply_loop(self) -> None:
+        while self._running:
+            payload = self._take_ready_payload()
+            if payload is None:
+                self._reply_wakeup.wait(timeout=0.2)
+                self._reply_wakeup.clear()
+                continue
+
+            version, wav = payload
+            if not wav:
+                continue
+
+            stt_cancel_event = threading.Event()
+            with self._pending_lock:
+                self._active_stt_cancel_event = stt_cancel_event
+
+            text = self.stt.transcribe(wav, cancel_event=stt_cancel_event)
+
+            with self._pending_lock:
+                if self._active_stt_cancel_event is stt_cancel_event:
+                    self._active_stt_cancel_event = None
+
+            if stt_cancel_event.is_set():
+                if self._requeue_interrupted_audio(wav, version):
+                    print("[VoiceAssistant] Cancel transcription and merge interrupted audio with supplemental speech")
+                else:
+                    print("[VoiceAssistant] Drop cancelled transcription")
+                continue
+
+            with self._pending_lock:
+                if version != self._pending_version:
+                    self._requeue_interrupted_audio(wav, version)
+                    print("[VoiceAssistant] Drop stale transcription due to newer speech")
+                    continue
+
+            if not text:
+                continue
+
+            text = collapse_repetitive_transcript(text)
+            if not text:
+                continue
+
+            print(f"[VoiceAssistant] Heard: '{text}'")
+
+            if self.WAKE_OFF in text:
+                self.voice_mode = False
+                self._clear_pending_inputs()
+                print("[VoiceAssistant] Voice mode -> OFF")
+                self._emit("语音功能已关闭")
+                continue
+
+            if self.WAKE_ON in text:
+                self.voice_mode = True
+                self._clear_pending_inputs()
+                print("[VoiceAssistant] Voice mode -> ON")
+                self._emit("语音功能已开启！我在听~")
+                continue
+
+            if self._on_transcript:
+                try:
+                    self._on_transcript(text)
+                except Exception:
+                    pass
+
+            if not self.voice_mode:
+                continue
+
+            cancel_event = threading.Event()
+            with self._pending_lock:
+                self._active_cancel_event = cancel_event
+
+            reply, reply_cancelled = self._generate_reply(text, cancel_event=cancel_event)
+
+            with self._pending_lock:
+                if self._active_cancel_event is cancel_event:
+                    self._active_cancel_event = None
+
+            if reply_cancelled:
+                if self._requeue_interrupted_audio(wav, version):
+                    print("[VoiceAssistant] Agent reply cancelled, merge current+supplemental audio and retry")
+                continue
+
+            if not reply:
+                continue
+
+            with self._pending_lock:
+                if version != self._pending_version:
+                    print("[VoiceAssistant] Drop stale reply due to newer speech")
+                    continue
+
+            print(f"[VoiceAssistant] Reply: '{reply}'")
+            self._emit(reply)
+
+    def _queue_pending_audio(self, wav: bytes) -> None:
+        if not wav:
+            return
+        with self._pending_lock:
+            if self._active_stt_cancel_event is not None:
+                self._active_stt_cancel_event.set()
+            if self._active_cancel_event is not None:
+                self._active_cancel_event.set()
+            self._pending_audio.append(wav)
+            self._pending_version += 1
+            self._pending_deadline = time.time() + max(0.1, self.cfg.reply_settle_sec)
+        self._reply_wakeup.set()
+
+    def _clear_pending_inputs(self) -> None:
+        with self._pending_lock:
+            if self._active_stt_cancel_event is not None:
+                self._active_stt_cancel_event.set()
+            if self._active_cancel_event is not None:
+                self._active_cancel_event.set()
+            self._pending_audio.clear()
+            self._pending_deadline = 0.0
+            self._pending_version += 1
+        self._reply_wakeup.set()
+
+    def _requeue_interrupted_audio(self, wav: bytes, base_version: int) -> bool:
+        """仅在检测到新语音到来时，将当前回合音频回插到队列头并累计重试。"""
+        with self._pending_lock:
+            # 只有存在更新版本（新语音）时才累计，避免无意义重复。
+            if base_version == self._pending_version or not self._pending_audio:
+                return False
+
+            self._pending_audio.appendleft(wav)
+            if self._pending_deadline <= 0:
+                self._pending_deadline = time.time() + max(0.1, self.cfg.reply_settle_sec)
+
+        self._reply_wakeup.set()
+        return True
+
+    def _take_ready_payload(self) -> tuple[int, bytes] | None:
+        with self._pending_lock:
+            if not self._pending_audio:
+                return None
+
+            now = time.time()
+            if now < self._pending_deadline:
+                return None
+
+            pending = list(self._pending_audio)
+            version = self._pending_version
+            self._pending_audio.clear()
+            self._pending_deadline = 0.0
+        merged_wav = merge_wav_chunks(
+            pending,
+            self.cfg.sample_rate,
+            self.cfg.channels,
+        )
+        return version, merged_wav
+
     # ── 内部方法 ────────────────────────────────────────────────────────
 
-    def _generate_reply(self, text: str) -> str:
+    def _generate_reply(self, text: str, cancel_event: threading.Event | None = None) -> tuple[str, bool]:
         """调用 LLM (本地 Qwen 或外部 Agent) 生成回复。"""
         if self._use_agent and self.agent:
             try:
-                return self.agent.run(text)
+                return self.agent.run(text, cancel_event=cancel_event), False
+            except GenerationCancelledError:
+                print("[VoiceAssistant] Agent reply cancelled")
+                return "", True
             except Exception as e:
-                return f"[Agent 错误] {e}"
+                return f"[Agent 错误] {e}", False
 
         if self.llm:
-            return self.llm.generate(text)
+            return self.llm.generate(text), False
 
-        return "语音助手未配置语言模型"
+        return "语音助手未配置语言模型", False
 
     def _emit(self, msg: str) -> None:
         """触发回复回调 (安全调用，忽略回调中的异常)。"""

@@ -26,6 +26,11 @@ COMPANION_SYSTEM_PROMPT = """你是电脑桌角上的小桌宠，正在对用户
 嘿嘿，你好像挺开心的嘛！
 
 若提供了「关于用户的已知信息」，可自然带一两字呼应，不要罗列、不要说「根据记忆」。
+
+【上下文优先级（必须遵守）】
+1) 若给了“用户刚说”或“中断上下文”，先回应用户当下意图，再做情绪安抚。
+2) 不要机械复读原句，但要保留关键词语义（例如在问能力、抱怨、求助时要对上）。
+3) 情绪标签只决定语气，不替代内容。
 """
 
 # scene key → 用户侧任务说明（非 Neutral 情绪 + 疲劳）
@@ -118,6 +123,9 @@ def build_care_messages(
     scene: str,
     hint: str = "",
     memory_text: str = "",
+    emotion_window: str = "",
+    interruption_context: str = "",
+    recent_user_speech: str = "",
 ) -> list[dict[str, str]]:
     key = (scene or "").strip().lower()
     if key not in SCENE_USER_PROMPTS:
@@ -127,12 +135,33 @@ def build_care_messages(
     if hint and hint.strip():
         user = f"{user}\n标签（勿朗读）：{hint.strip()[:40]}"
 
+    if emotion_window and emotion_window.strip():
+        user = f"{user}\n情绪窗口（勿朗读）：{emotion_window.strip()[:180]}"
+
+    if interruption_context and interruption_context.strip():
+        user = (
+            f"{user}\n中断上下文（勿朗读）：{interruption_context.strip()[:220]}\n"
+            "要求：若出现 interrupted=true，先接住被打断的话题。"
+        )
+
+    if recent_user_speech and recent_user_speech.strip():
+        user = (
+            f"{user}\n用户刚说（勿逐字复读）：{recent_user_speech.strip()[:120]}\n"
+            "要求：先对这句话做同语义回应，再补一句情绪陪伴。"
+        )
+
     mem = (memory_text or "").strip()
     if mem and mem != "暂无历史信息":
         user = (
             f"{user}\n\n【关于用户的已知信息】\n{mem}\n"
             "若相关，可自然带一句呼应；无关则忽略。不要罗列记忆。"
         )
+
+    user = (
+        f"{user}\n\n"
+        "输出检查：如果用户刚说里包含明确问题/质疑，台词里必须有对应回应；"
+        "不要只说泛化安慰。"
+    )
 
     return [
         {"role": "system", "content": COMPANION_SYSTEM_PROMPT},

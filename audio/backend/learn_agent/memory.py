@@ -1,3 +1,6 @@
+import copy
+
+
 # 简单的内存模块，保存对话上下文
 class Memory:
     def __init__(self):
@@ -13,3 +16,9 @@ class Memory:
 
     def get_context(self) -> list[dict]:
         return self.messages  # 返回当前的对话上下文,每次请求都带上
+
+    def snapshot(self) -> list[dict]:
+        return copy.deepcopy(self.messages)
+
+    def restore(self, snapshot: list[dict]) -> None:
+        self.messages = copy.deepcopy(snapshot)
